@@ -7,11 +7,14 @@ import dev.hm02.mail.data.AccountStore
 import dev.hm02.mail.data.AccountSyncError
 import dev.hm02.mail.data.ImapSmtpMailClient
 import dev.hm02.mail.data.MailClient
+import dev.hm02.mail.data.SettingsAndContactsStore
 import dev.hm02.mail.model.ComposeMode
+import dev.hm02.mail.model.ContactSuggestion
 import dev.hm02.mail.model.EmailAccount
 import dev.hm02.mail.model.EmailDetail
 import dev.hm02.mail.model.EmailSummary
 import dev.hm02.mail.model.OutgoingEmailDraft
+import dev.hm02.mail.model.UserSettings
 import dev.hm02.mail.policy.MailPolicyConfig
 import dev.hm02.mail.policy.MailPolicyProvider
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,6 +32,7 @@ sealed interface ActivePane {
   data class Reader(val summary: EmailSummary, val detail: EmailDetail?, val isLoading: Boolean, val error: String?) : ActivePane
   data class Composer(val initialDraft: OutgoingEmailDraft) : ActivePane
   data object Accounts : ActivePane
+  data object Settings : ActivePane
 }
 
 data class HM02UiState(
@@ -37,6 +41,11 @@ data class HM02UiState(
   val policyEmptyDescription: String = "",
   val blockRemoteMediaInEmails: Boolean = true,
   val blockExternalImagesByDefault: Boolean = false,
+  val settings: UserSettings = UserSettings(),
+  val hasContactsPermission: Boolean = false,
+  val savedContactsCount: Int = 0,
+  val flaggedEmailsCount: Int = 0,
+  val contactSuggestions: List<ContactSuggestion> = emptyList(),
   val accounts: List<EmailAccount> = emptyList(),
   val feedItems: List<EmailSummary> = emptyList(),
   val failedAccountSyncs: List<AccountSyncError> = emptyList(),
@@ -53,9 +62,12 @@ data class HM02UiState(
 
 class HM02ViewModel(
   private val accountStore: AccountStore,
+  private val settingsAndContactsStore: SettingsAndContactsStore,
   private val mailClient: MailClient = ImapSmtpMailClient(),
   private val policyConfig: MailPolicyConfig = MailPolicyProvider.getConfig(),
 ) : ViewModel() {
+
+  private var latestSyncedFeedItems: List<EmailSummary> = emptyList()
 
   private val _uiState = MutableStateFlow(
     HM02UiState(
@@ -64,6 +76,10 @@ class HM02ViewModel(
       policyEmptyDescription = policyConfig.feedPolicy.emptyStateDescription,
       blockRemoteMediaInEmails = policyConfig.blockRemoteMediaInEmails,
       blockExternalImagesByDefault = policyConfig.blockExternalImagesByDefault,
+      settings = settingsAndContactsStore.settings.value,
+      hasContactsPermission = settingsAndContactsStore.hasContactsPermission(),
+      savedContactsCount = settingsAndContactsStore.savedContacts.value.size,
+      flaggedEmailsCount = settingsAndContactsStore.flaggedEmails.value.size,
       accounts = accountStore.accounts.value,
     ),
   )
@@ -77,6 +93,41 @@ class HM02ViewModel(
         }
       }
     }
+    viewModelScope.launch {
+      settingsAndContactsStore.settings.collect { updatedSettings ->
+        _uiState.update { state ->
+          state.copy(
+            settings = updatedSettings,
+            feedItems = mergeFeedWithFlagged(
+              syncedItems = latestSyncedFeedItems,
+              flaggedItems = settingsAndContactsStore.flaggedEmails.value,
+              enableFlagForLater = updatedSettings.enableFlagForLater,
+            ),
+          )
+        }
+      }
+    }
+    viewModelScope.launch {
+      settingsAndContactsStore.flaggedEmails.collect { flaggedList ->
+        _uiState.update { state ->
+          state.copy(
+            flaggedEmailsCount = flaggedList.size,
+            feedItems = mergeFeedWithFlagged(
+              syncedItems = latestSyncedFeedItems,
+              flaggedItems = flaggedList,
+              enableFlagForLater = state.settings.enableFlagForLater,
+            ),
+          )
+        }
+      }
+    }
+    viewModelScope.launch {
+      settingsAndContactsStore.savedContacts.collect { contacts ->
+        _uiState.update { state ->
+          state.copy(savedContactsCount = contacts.size)
+        }
+      }
+    }
   }
 
   /**
@@ -84,8 +135,10 @@ class HM02ViewModel(
    * or taps the manual refresh icon.
    */
   fun refreshFeed() {
+    refreshContactsPermissionState()
     val accounts = accountStore.accounts.value
     if (accounts.isEmpty()) {
+      latestSyncedFeedItems = emptyList()
       _uiState.update {
         it.copy(
           feedItems = emptyList(),
@@ -100,6 +153,7 @@ class HM02ViewModel(
     viewModelScope.launch {
       _uiState.update { it.copy(isRefreshingFeed = true, statusMessage = null) }
       val syncResult = mailClient.fetchFeed(accounts, policyConfig)
+      latestSyncedFeedItems = syncResult.items
       val failures = syncResult.failedAccounts
       val errorNotice = when {
         failures.isEmpty() -> null
@@ -109,9 +163,13 @@ class HM02ViewModel(
           "Partial sync error (${failures.joinToString { it.accountEmail }})"
       }
 
-      _uiState.update {
-        it.copy(
-          feedItems = syncResult.items,
+      _uiState.update { state ->
+        state.copy(
+          feedItems = mergeFeedWithFlagged(
+            syncedItems = latestSyncedFeedItems,
+            flaggedItems = settingsAndContactsStore.flaggedEmails.value,
+            enableFlagForLater = state.settings.enableFlagForLater,
+          ),
           failedAccountSyncs = failures,
           isRefreshingFeed = false,
           lastRefreshedAtMillis = System.currentTimeMillis(),
@@ -148,9 +206,15 @@ class HM02ViewModel(
       val result = mailClient.searchMessages(accounts, query)
       result.fold(
         onSuccess = { items ->
+          val flaggedKeys = settingsAndContactsStore.flaggedEmails.value
+            .map { it.compositeKey }
+            .toSet()
+          val decoratedItems = items.map { item ->
+            item.copy(isFlagged = item.isFlagged || item.compositeKey in flaggedKeys)
+          }
           _uiState.update {
             it.copy(
-              searchResults = items,
+              searchResults = decoratedItems,
               isSearching = false,
             )
           }
@@ -178,20 +242,117 @@ class HM02ViewModel(
   }
 
   fun showFeed() {
-    _uiState.update { it.copy(activePane = ActivePane.Feed) }
+    _uiState.update {
+      it.copy(
+        activePane = ActivePane.Feed,
+        contactSuggestions = emptyList(),
+      )
+    }
   }
 
   fun showAccounts() {
     _uiState.update { it.copy(activePane = ActivePane.Accounts, statusMessage = null) }
   }
 
+  fun showSettings() {
+    refreshContactsPermissionState()
+    _uiState.update { it.copy(activePane = ActivePane.Settings, statusMessage = null) }
+  }
+
+  fun refreshContactsPermissionState() {
+    val granted = settingsAndContactsStore.hasContactsPermission()
+    _uiState.update { it.copy(hasContactsPermission = granted) }
+  }
+
+  fun updateAccessDeviceContacts(enabled: Boolean) {
+    settingsAndContactsStore.updateSettings { it.copy(accessDeviceContacts = enabled) }
+    refreshContactsPermissionState()
+  }
+
+  fun updateSaveContactsFromEmails(enabled: Boolean) {
+    settingsAndContactsStore.updateSettings { it.copy(saveContactsFromEmails = enabled) }
+  }
+
+  fun updateEnableFlagForLater(enabled: Boolean) {
+    settingsAndContactsStore.updateSettings { it.copy(enableFlagForLater = enabled) }
+  }
+
+  fun toggleFlagged(email: EmailSummary) {
+    val nowFlagged = settingsAndContactsStore.toggleFlaggedEmail(email)
+    latestSyncedFeedItems = latestSyncedFeedItems.map {
+      if (it.compositeKey == email.compositeKey) it.copy(isFlagged = nowFlagged) else it
+    }
+    _uiState.update { state ->
+      val updatedPane = when (val pane = state.activePane) {
+        is ActivePane.Reader -> {
+          if (pane.summary.compositeKey == email.compositeKey) {
+            val updatedSummary = pane.summary.copy(isFlagged = nowFlagged)
+            pane.copy(
+              summary = updatedSummary,
+              detail = pane.detail?.copy(summary = updatedSummary),
+            )
+          } else {
+            pane
+          }
+        }
+        else -> pane
+      }
+      state.copy(
+        feedItems = mergeFeedWithFlagged(
+          syncedItems = latestSyncedFeedItems,
+          flaggedItems = settingsAndContactsStore.flaggedEmails.value,
+          enableFlagForLater = state.settings.enableFlagForLater,
+        ),
+        searchResults = state.searchResults.map {
+          if (it.compositeKey == email.compositeKey) it.copy(isFlagged = nowFlagged) else it
+        },
+        activePane = updatedPane,
+        statusMessage = if (nowFlagged) "Flagged for later (saved to feed)" else "Removed flag",
+      )
+    }
+
+    val account = accountStore.accounts.value.find { it.id == email.accountId } ?: return
+    viewModelScope.launch {
+      mailClient.setMessageFlagged(account, email.uid, nowFlagged)
+    }
+  }
+
+  fun saveSenderContact(summary: EmailSummary) {
+    settingsAndContactsStore.addSavedContacts(
+      listOf(
+        ContactSuggestion(
+          name = summary.fromName.takeIf { !it.equals(summary.fromAddress, ignoreCase = true) }.orEmpty(),
+          emailAddress = summary.fromAddress,
+          source = "Email",
+        ),
+      ),
+    )
+    _uiState.update {
+      it.copy(statusMessage = "Saved ${summary.fromName} <${summary.fromAddress}> to contacts")
+    }
+  }
+
+  fun updateContactAutocompleteQuery(rawInput: String) {
+    viewModelScope.launch {
+      val suggestions = settingsAndContactsStore.queryContactSuggestions(rawInput)
+      _uiState.update { it.copy(contactSuggestions = suggestions) }
+    }
+  }
+
+  fun clearContactSuggestions() {
+    _uiState.update { it.copy(contactSuggestions = emptyList()) }
+  }
+
   fun openMessage(summary: EmailSummary) {
     val account = accountStore.accounts.value.find { it.id == summary.accountId } ?: return
+    val isCurrentlyFlagged = summary.isFlagged || settingsAndContactsStore.isEmailFlagged(summary.compositeKey)
+    val hydratedSummary = summary.copy(isFlagged = isCurrentlyFlagged)
+
     viewModelScope.launch {
       _uiState.update {
         it.copy(
           activePane = ActivePane.Reader(
-            summary = summary,
+            summary = hydratedSummary,
             detail = null,
             isLoading = true,
             error = null,
@@ -201,17 +362,28 @@ class HM02ViewModel(
       val result = mailClient.fetchMessageDetail(account, summary.uid)
       result.fold(
         onSuccess = { detail ->
+          settingsAndContactsStore.harvestContactsFromEmail(detail)
+          settingsAndContactsStore.markFlaggedEmailRead(summary.compositeKey)
+          latestSyncedFeedItems = latestSyncedFeedItems.map {
+            if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
+          }
+          val flaggedNow = detail.summary.isFlagged || settingsAndContactsStore.isEmailFlagged(summary.compositeKey)
+          val updatedSummary = detail.summary.copy(isUnread = false, isFlagged = flaggedNow)
+          val updatedDetail = detail.copy(summary = updatedSummary)
+
           _uiState.update { state ->
             state.copy(
-              feedItems = state.feedItems.map {
-                if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
-              },
+              feedItems = mergeFeedWithFlagged(
+                syncedItems = latestSyncedFeedItems,
+                flaggedItems = settingsAndContactsStore.flaggedEmails.value,
+                enableFlagForLater = state.settings.enableFlagForLater,
+              ),
               searchResults = state.searchResults.map {
                 if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
               },
               activePane = ActivePane.Reader(
-                summary = detail.summary,
-                detail = detail,
+                summary = updatedSummary,
+                detail = updatedDetail,
                 isLoading = false,
                 error = null,
               ),
@@ -222,7 +394,7 @@ class HM02ViewModel(
           _uiState.update {
             it.copy(
               activePane = ActivePane.Reader(
-                summary = summary,
+                summary = hydratedSummary,
                 detail = null,
                 isLoading = false,
                 error = error.localizedMessage ?: "Failed to load email body.",
@@ -247,6 +419,7 @@ class HM02ViewModel(
     }
     _uiState.update {
       it.copy(
+        contactSuggestions = emptyList(),
         activePane = ActivePane.Composer(
           OutgoingEmailDraft(
             fromAccount = defaultAccount,
@@ -280,6 +453,7 @@ class HM02ViewModel(
     // Two full blank lines of clean breathing room above the quoted email
     _uiState.update {
       it.copy(
+        contactSuggestions = emptyList(),
         activePane = ActivePane.Composer(
           OutgoingEmailDraft(
             fromAccount = account,
@@ -310,6 +484,7 @@ class HM02ViewModel(
     // Two full blank lines of clean breathing room above the forwarded email
     _uiState.update {
       it.copy(
+        contactSuggestions = emptyList(),
         activePane = ActivePane.Composer(
           OutgoingEmailDraft(
             fromAccount = account,
@@ -334,9 +509,11 @@ class HM02ViewModel(
       val result = mailClient.sendEmail(draft)
       result.fold(
         onSuccess = {
+          settingsAndContactsStore.harvestContactsFromRawAddresses("${draft.to},${draft.cc}")
           _uiState.update {
             it.copy(
               isSendingEmail = false,
+              contactSuggestions = emptyList(),
               activePane = ActivePane.Feed,
               statusMessage = "Email sent from ${draft.fromAccount.emailAddress}",
             )
@@ -383,11 +560,38 @@ class HM02ViewModel(
 
   fun removeAccount(accountId: String) {
     accountStore.removeAccount(accountId)
+    settingsAndContactsStore.removeFlaggedForAccount(accountId)
     refreshFeed()
   }
 
   fun dismissStatusMessage() {
     _uiState.update { it.copy(statusMessage = null) }
+  }
+
+  private fun mergeFeedWithFlagged(
+    syncedItems: List<EmailSummary>,
+    flaggedItems: List<EmailSummary>,
+    enableFlagForLater: Boolean,
+  ): List<EmailSummary> {
+    if (!enableFlagForLater || flaggedItems.isEmpty()) {
+      return syncedItems.map { it.copy(isFlagged = false) }
+    }
+    val flaggedByKey = flaggedItems.associateBy { it.compositeKey }
+    val merged = LinkedHashMap<String, EmailSummary>()
+
+    for (item in syncedItems) {
+      val isPinned = flaggedByKey.containsKey(item.compositeKey)
+      merged[item.compositeKey] = item.copy(isFlagged = isPinned)
+    }
+    for (flagged in flaggedItems) {
+      if (!merged.containsKey(flagged.compositeKey)) {
+        merged[flagged.compositeKey] = flagged.copy(isFlagged = true)
+      }
+    }
+    return merged.values.sortedWith(
+      compareByDescending<EmailSummary> { it.isFlagged }
+        .thenByDescending { it.receivedAtEpochMillis },
+    )
   }
 
   private fun buildQuotedBody(detail: EmailDetail, prefixLines: Boolean): String {
@@ -411,12 +615,14 @@ class HM02ViewModel(
   companion object {
     fun provideFactory(
       accountStore: AccountStore,
+      settingsAndContactsStore: SettingsAndContactsStore,
       policyConfig: MailPolicyConfig = MailPolicyProvider.getConfig(),
     ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
       @Suppress("UNCHECKED_CAST")
       override fun <T : ViewModel> create(modelClass: Class<T>): T {
         return HM02ViewModel(
           accountStore = accountStore,
+          settingsAndContactsStore = settingsAndContactsStore,
           mailClient = ImapSmtpMailClient(),
           policyConfig = policyConfig,
         ) as T

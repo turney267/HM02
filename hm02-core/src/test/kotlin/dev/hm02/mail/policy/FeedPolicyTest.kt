@@ -1,9 +1,14 @@
 package dev.hm02.mail.policy
 
+import dev.hm02.mail.data.computeDayWindowStartMillis
+import dev.hm02.mail.data.parseQuickDaySearchDays
 import dev.hm02.mail.model.EmailSummary
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.minutes
 
 class FeedPolicyTest {
@@ -41,35 +46,41 @@ class FeedPolicyTest {
   }
 
   @Test
-  fun `MailPolicyConfig enforces 10m window, bulk sender filter, blocked domains, and allowed overrides`() {
+  fun `MailPolicyConfig enforces 10m window without sender blocklists`() {
     val config = MailPolicyConfig(
       brandTitle = "Fly",
       feedPolicy = TimeWindowFeedPolicy(window = 10.minutes),
-      hideBulkAutomatedSendersInFeed = true,
-      blockedSenderDomains = setOf("linkedin.com", "substack.com"),
-      blockedSubjectKeywords = setOf("unsubscribe", "flash sale"),
-      allowedSenderDomainsOverride = setOf("important.gov"),
     )
     val nowMillis = 1_700_000_000_000L
     val twoMinsAgo = nowMillis - 2.minutes.inWholeMilliseconds
+    val fifteenMinsAgo = nowMillis - 15.minutes.inWholeMilliseconds
 
-    val humanEmail = sampleEmail(receivedAtEpochMillis = twoMinsAgo, fromAddress = "colleague@company.com")
-    val noreplyEmail = sampleEmail(receivedAtEpochMillis = twoMinsAgo, fromAddress = "noreply@service.com")
-    val blockedDomainEmail = sampleEmail(receivedAtEpochMillis = twoMinsAgo, fromAddress = "updates@mail.linkedin.com")
-    val blockedSubjectEmail = sampleEmail(
-      receivedAtEpochMillis = twoMinsAgo,
-      fromAddress = "shop@store.com",
-      subject = "24-Hour Flash Sale Starts Now",
-    )
-    val overriddenGovEmail = sampleEmail(
-      receivedAtEpochMillis = twoMinsAgo,
-      fromAddress = "noreply@alerts.important.gov",
-    )
+    val recentEmail = sampleEmail(receivedAtEpochMillis = twoMinsAgo, fromAddress = "anyone@company.com")
+    val olderEmail = sampleEmail(receivedAtEpochMillis = fifteenMinsAgo, fromAddress = "anyone@company.com")
 
-    assertTrue(config.evaluateFeedInclusion(humanEmail, nowMillis))
-    assertFalse(config.evaluateFeedInclusion(noreplyEmail, nowMillis))
-    assertFalse(config.evaluateFeedInclusion(blockedDomainEmail, nowMillis))
-    assertFalse(config.evaluateFeedInclusion(blockedSubjectEmail, nowMillis))
-    assertTrue(config.evaluateFeedInclusion(overriddenGovEmail, nowMillis))
+    assertTrue(config.evaluateFeedInclusion(recentEmail, nowMillis))
+    assertFalse(config.evaluateFeedInclusion(olderEmail, nowMillis))
+  }
+
+  @Test
+  fun `parseQuickDaySearchDays parses a, a2, a7 and ignores normal keywords`() {
+    assertEquals(1, parseQuickDaySearchDays("a"))
+    assertEquals(1, parseQuickDaySearchDays("A"))
+    assertEquals(1, parseQuickDaySearchDays(" a1 "))
+    assertEquals(2, parseQuickDaySearchDays("a2"))
+    assertEquals(7, parseQuickDaySearchDays("a7"))
+    assertNull(parseQuickDaySearchDays("amazon"))
+    assertNull(parseQuickDaySearchDays("a0"))
+    assertNull(parseQuickDaySearchDays("invoice"))
+  }
+
+  @Test
+  fun `computeDayWindowStartMillis returns start of today for a and yesterday for a2`() {
+    val now = 1_700_050_000_000L
+    val startToday = computeDayWindowStartMillis(days = 1, nowMillis = now)
+    val startYesterday = computeDayWindowStartMillis(days = 2, nowMillis = now)
+
+    assertTrue(startToday <= now)
+    assertEquals(1.days.inWholeMilliseconds, startToday - startYesterday)
   }
 }

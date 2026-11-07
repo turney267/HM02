@@ -4,4 +4,7 @@
     <!-- Foreground IMAP/SMTP network access only. No notifications or background sync permissions. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Optional: Requested at runtime only when the user enables "Access Contacts" in Settings. -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+
 </manifest>

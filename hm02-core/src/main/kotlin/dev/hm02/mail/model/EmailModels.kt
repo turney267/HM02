@@ -95,17 +95,19 @@ data class EmailAccount(
  * Lightweight email header representation for the feed and search results.
  * No bodies are downloaded until the user taps an email to read it.
  */
+@Serializable
 data class EmailSummary(
   val uid: Long,
   val accountId: String,
   val accountEmail: String,
   val accountDisplayName: String,
-  val messageIdHeader: String?,
+  val messageIdHeader: String? = null,
   val subject: String,
   val fromName: String,
   val fromAddress: String,
   val receivedAtEpochMillis: Long,
   val isUnread: Boolean,
+  val isFlagged: Boolean = false,
 ) {
   val compositeKey: String
     get() = "$accountId:$uid"
@@ -144,3 +146,30 @@ data class OutgoingEmailDraft(
   val inReplyToMessageId: String? = null,
   val referencesHeader: String? = null,
 )
+
+/**
+ * User-configurable settings for Contacts and Flagging emails for later.
+ */
+@Serializable
+data class UserSettings(
+  val accessDeviceContacts: Boolean = false,
+  val saveContactsFromEmails: Boolean = false,
+  val enableFlagForLater: Boolean = false,
+)
+
+/**
+ * Contact entry used for recipient autocomplete in Compose / Reply / Forward.
+ */
+@Serializable
+data class ContactSuggestion(
+  val name: String,
+  val emailAddress: String,
+  val source: String = "Saved",
+) {
+  val formatted: String
+    get() = if (name.isNotBlank() && !name.equals(emailAddress, ignoreCase = true)) {
+      "$name <$emailAddress>"
+    } else {
+      emailAddress
+    }
+}

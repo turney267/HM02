@@ -9,6 +9,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.hm02.mail.data.AccountStore
+import dev.hm02.mail.data.SettingsAndContactsStore
 import dev.hm02.mail.policy.MailPolicyConfig
 import dev.hm02.mail.policy.MailPolicyProvider
 import dev.hm02.mail.ui.main.HM02AppScreen
@@ -31,6 +32,7 @@ open class HM02MailActivity : ComponentActivity() {
     super.onCreate(savedInstanceState)
 
     val accountStore = AccountStore(applicationContext)
+    val settingsAndContactsStore = SettingsAndContactsStore(applicationContext)
     val policyConfig = resolvePolicyConfig()
 
     enableEdgeToEdge()
@@ -44,6 +46,7 @@ open class HM02MailActivity : ComponentActivity() {
           val hm02ViewModel: HM02ViewModel = viewModel(
             factory = HM02ViewModel.provideFactory(
               accountStore = accountStore,
+              settingsAndContactsStore = settingsAndContactsStore,
               policyConfig = policyConfig,
             ),
           )

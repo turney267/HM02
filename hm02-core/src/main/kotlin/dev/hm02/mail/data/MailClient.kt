@@ -47,11 +47,54 @@ data class FeedSyncResult(
 )
 
 /**
+ * Parses quick day-range search shortcuts:
+ * - `"a"` or `"a1"` -> `1` (all emails from today)
+ * - `"a2"` -> `2` (all emails from yesterday and today)
+ * - `"a<N>"` -> `N` (all emails from the last N calendar days including today)
+ * Returns `null` if [query] is a normal keyword search.
+ */
+fun parseQuickDaySearchDays(query: String): Int? {
+  val match = QUICK_DAY_SEARCH_REGEX.matchEntire(query.trim()) ?: return null
+  val digits = match.groupValues[1]
+  return if (digits.isEmpty()) {
+    1
+  } else {
+    digits.toIntOrNull()?.takeIf { it in 1..365 }
+  }
+}
+
+/**
+ * Computes the local start-of-day (`00:00:00.000`) epoch timestamp for a [days]-day window:
+ * - `days = 1` ("a"): today at `00:00:00.000`
+ * - `days = 2` ("a2"): yesterday at `00:00:00.000` (yesterday + today)
+ * - `days = N` ("aN"): `(N - 1)` days before today at `00:00:00.000`
+ */
+fun computeDayWindowStartMillis(
+  days: Int,
+  nowMillis: Long = System.currentTimeMillis(),
+): Long {
+  val calendar = Calendar.getInstance().apply {
+    timeInMillis = nowMillis
+    set(Calendar.HOUR_OF_DAY, 0)
+    set(Calendar.MINUTE, 0)
+    set(Calendar.SECOND, 0)
+    set(Calendar.MILLISECOND, 0)
+    if (days > 1) {
+      add(Calendar.DAY_OF_YEAR, -(days - 1))
+    }
+  }
+  return calendar.timeInMillis
+}
+
+private val QUICK_DAY_SEARCH_REGEX = Regex("^a(\\d*)$", RegexOption.IGNORE_CASE)
+
+/**
  * Abstraction for the bare-bones HM02 email operations:
  * 1. Fetch feed across multiple accounts according to [MailPolicyConfig], reporting partial or full errors
- * 2. Server-side search across multiple accounts
+ * 2. Server-side search across multiple accounts (including `"a"` / `"a2"` day shortcuts)
  * 3. Read full email message by UID
  * 4. Send email (new, reply, forward)
+ * 5. Flag/unflag message on IMAP server
  */
 interface MailClient {
   suspend fun verifyAccount(account: EmailAccount): Result<Unit>
@@ -59,10 +102,11 @@ interface MailClient {
   suspend fun searchMessages(
     accounts: List<EmailAccount>,
     query: String,
-    maxPerAccount: Int = 30,
+    maxPerAccount: Int = 50,
   ): Result<List<EmailSummary>>
   suspend fun fetchMessageDetail(account: EmailAccount, uid: Long): Result<EmailDetail>
   suspend fun sendEmail(draft: OutgoingEmailDraft): Result<Unit>
+  suspend fun setMessageFlagged(account: EmailAccount, uid: Long, flagged: Boolean): Result<Unit>
 }
 
 /**
@@ -265,6 +309,26 @@ class ImapSmtpMailClient : MailClient {
       }
     }
 
+  override suspend fun setMessageFlagged(
+    account: EmailAccount,
+    uid: Long,
+    flagged: Boolean,
+  ): Result<Unit> = withContext(Dispatchers.IO) {
+    runCatching {
+      openImapStore(account).use { store ->
+        val folder = store.getFolder(INBOX_FOLDER)
+        val uidFolder = folder as? UIDFolder ?: return@runCatching
+        folder.open(Folder.READ_WRITE)
+        try {
+          val message = uidFolder.getMessageByUID(uid) ?: return@runCatching
+          message.setFlag(Flags.Flag.FLAGGED, flagged)
+        } finally {
+          runCatching { folder.close(false) }
+        }
+      }
+    }
+  }
+
   private fun fetchAccountFeed(
     account: EmailAccount,
     config: MailPolicyConfig,
@@ -317,6 +381,31 @@ class ImapSmtpMailClient : MailClient {
       val uidFolder = folder as? UIDFolder ?: return emptyList()
       folder.open(Folder.READ_ONLY)
       try {
+        val quickDays = parseQuickDaySearchDays(query)
+        if (quickDays != null) {
+          val windowStartMillis = computeDayWindowStartMillis(quickDays)
+          // Subtract 24h for the coarse IMAP SINCE search to guard against server timezone differences,
+          // then apply exact local-time filtering on receivedAtEpochMillis.
+          val imapSinceDate = Date(windowStartMillis - 86_400_000L)
+          val candidateMessages = folder.search(
+            ReceivedDateTerm(ComparisonTerm.GE, imapSinceDate),
+          ).takeLast(maxOf(maxPerAccount, 100)).toTypedArray()
+
+          if (candidateMessages.isEmpty()) return emptyList()
+
+          prefetchHeaders(folder, candidateMessages)
+
+          return candidateMessages
+            .mapNotNull { msg ->
+              runCatching {
+                val uid = uidFolder.getUID(msg)
+                msg.toEmailSummary(account, uid)
+              }.getOrNull()
+            }
+            .filter { it.receivedAtEpochMillis >= windowStartMillis }
+            .sortedByDescending { it.receivedAtEpochMillis }
+        }
+
         val searchTerm = OrTerm(
           arrayOf(
             SubjectTerm(query),
@@ -389,6 +478,7 @@ class ImapSmtpMailClient : MailClient {
       ?: "(No Subject)"
     val timestamp = (receivedDate ?: sentDate)?.time ?: 0L
     val unread = !flags.contains(Flags.Flag.SEEN)
+    val flagged = flags.contains(Flags.Flag.FLAGGED)
 
     return EmailSummary(
       uid = uid,
@@ -401,6 +491,7 @@ class ImapSmtpMailClient : MailClient {
       fromAddress = fromEmail,
       receivedAtEpochMillis = timestamp,
       isUnread = unread,
+      isFlagged = flagged,
     )
   }
 
