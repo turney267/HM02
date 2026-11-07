@@ -46,7 +46,6 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -73,7 +72,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.TextRange
@@ -108,6 +113,50 @@ import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+/**
+ * Custom Material pushpin vector icon used for "Pin to Feed".
+ */
+private val PushPinIcon: ImageVector by lazy {
+  ImageVector.Builder(
+    name = "PushPin",
+    defaultWidth = 24.dp,
+    defaultHeight = 24.dp,
+    viewportWidth = 24f,
+    viewportHeight = 24f,
+  ).apply {
+    path(
+      fill = SolidColor(Color.Black),
+      fillAlpha = 1f,
+      stroke = null,
+      strokeAlpha = 1f,
+      strokeLineWidth = 1f,
+      strokeLineCap = StrokeCap.Butt,
+      strokeLineJoin = StrokeJoin.Bevel,
+      strokeLineMiter = 1f,
+      pathFillType = PathFillType.NonZero,
+    ) {
+      moveTo(16f, 12f)
+      verticalLineTo(4f)
+      horizontalLineTo(17f)
+      verticalLineTo(2f)
+      horizontalLineTo(7f)
+      verticalLineTo(4f)
+      horizontalLineTo(8f)
+      verticalLineTo(12f)
+      lineTo(6f, 14f)
+      verticalLineTo(16f)
+      horizontalLineTo(11.2f)
+      verticalLineTo(22f)
+      horizontalLineTo(12.8f)
+      verticalLineTo(16f)
+      horizontalLineTo(18f)
+      verticalLineTo(14f)
+      lineTo(16f, 12f)
+      close()
+    }
+  }.build()
+}
 
 @Composable
 fun HM02AppScreen(
@@ -144,8 +193,9 @@ fun HM02AppScreen(
     viewModel.showFeed()
   }
 
-  // Opening an email (Reader) or composing/replying/forwarding (Composer) is 100% full-screen.
-  val isFullScreenPane = uiState.activePane is ActivePane.Reader || uiState.activePane is ActivePane.Composer
+  // Reader, Composer, Accounts, and Settings are all 100% full-screen with "blank page" vibes.
+  val isFullScreenPane = uiState.activePane !is ActivePane.Feed &&
+    uiState.activePane !is ActivePane.SearchResults
 
   Scaffold(
     modifier = modifier
@@ -169,7 +219,7 @@ fun HM02AppScreen(
       }
     },
     floatingActionButton = {
-      if (uiState.activePane is ActivePane.Feed || uiState.activePane is ActivePane.SearchResults) {
+      if (!isFullScreenPane) {
         SurfPillButton(
           label = "+ Compose",
           isPrimary = true,
@@ -189,7 +239,7 @@ fun HM02AppScreen(
           FeedPane(
             uiState = uiState,
             onEmailClick = viewModel::openMessage,
-            onToggleFlag = viewModel::toggleFlagged,
+            onTogglePin = viewModel::toggleFlagged,
             onAddAccountClick = viewModel::showAccounts,
           )
         }
@@ -199,9 +249,9 @@ fun HM02AppScreen(
             query = pane.query,
             isSearching = uiState.isSearching,
             results = uiState.searchResults,
-            enableFlagForLater = uiState.settings.enableFlagForLater,
+            enablePinToFeed = uiState.settings.enablePinToFeed,
             onEmailClick = viewModel::openMessage,
-            onToggleFlag = viewModel::toggleFlagged,
+            onTogglePin = viewModel::toggleFlagged,
             onBackToFeed = viewModel::clearSearchAndReturnToFeed,
           )
         }
@@ -214,9 +264,9 @@ fun HM02AppScreen(
             error = pane.error,
             blockRemoteMedia = uiState.blockRemoteMediaInEmails,
             blockExternalImages = uiState.blockExternalImagesByDefault,
-            enableFlagForLater = uiState.settings.enableFlagForLater,
-            saveContactsFromEmails = uiState.settings.saveContactsFromEmails,
-            onToggleFlag = { viewModel.toggleFlagged(pane.summary) },
+            enablePinToFeed = uiState.settings.enablePinToFeed,
+            accessDeviceContacts = uiState.settings.accessDeviceContacts,
+            onTogglePin = { viewModel.toggleFlagged(pane.summary) },
             onSaveSenderContact = { viewModel.saveSenderContact(pane.summary) },
             onBack = viewModel::showFeed,
             onReply = { detail -> viewModel.startReply(detail) },
@@ -251,8 +301,7 @@ fun HM02AppScreen(
           SettingsPane(
             uiState = uiState,
             onToggleAccessContacts = viewModel::updateAccessDeviceContacts,
-            onToggleSaveContactsFromEmails = viewModel::updateSaveContactsFromEmails,
-            onToggleFlagForLater = viewModel::updateEnableFlagForLater,
+            onTogglePinToFeed = viewModel::updateEnablePinToFeed,
             onContactsPermissionResult = { granted ->
               viewModel.refreshContactsPermissionState()
               if (granted) {
@@ -287,7 +336,6 @@ private fun HM02TopBar(
       .fillMaxWidth()
       .background(surfColors.headerBg),
   ) {
-    // Minimalist Header Row: Brand Title on Left, Refresh, Accounts & Settings IconButtons on Right
     Row(
       modifier = Modifier
         .fillMaxWidth()
@@ -334,7 +382,6 @@ private fun HM02TopBar(
       }
     }
 
-    // Search Input Box with embedded Clear and Search icons (supports "a" = today, "a2" = yesterday & today)
     Box(
       modifier = Modifier
         .fillMaxWidth()
@@ -418,7 +465,6 @@ private fun HM02TopBar(
       )
     }
 
-    // 3dp Slim Horizontal Progress Bar matching HM03 IntentBrowserActivity
     if (isBusy) {
       LinearProgressIndicator(
         modifier = Modifier
@@ -437,12 +483,11 @@ private fun HM02TopBar(
 private fun FeedPane(
   uiState: HM02UiState,
   onEmailClick: (EmailSummary) -> Unit,
-  onToggleFlag: (EmailSummary) -> Unit,
+  onTogglePin: (EmailSummary) -> Unit,
   onAddAccountClick: () -> Unit,
 ) {
   val surfColors = LocalSurfColors.current
 
-  // Tick every 5 seconds while the screen is open so "Last updated 27s ago" stays accurate
   var currentClockMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
   LaunchedEffect(uiState.lastRefreshedAtMillis) {
     while (true) {
@@ -488,7 +533,6 @@ private fun FeedPane(
   }
 
   Column(modifier = Modifier.fillMaxSize()) {
-    // Subtle "Last updated Xs ago" + partial/full sync error indicator at the top of the feed
     FeedStatusHeader(
       lastRefreshedAtMillis = uiState.lastRefreshedAtMillis,
       currentClockMillis = currentClockMillis,
@@ -532,8 +576,8 @@ private fun FeedPane(
           EmailSummaryCard(
             email = email,
             showAccountBadge = uiState.accounts.size > 1,
-            showFlagAction = uiState.settings.enableFlagForLater,
-            onToggleFlag = { onToggleFlag(email) },
+            showPinAction = uiState.settings.enablePinToFeed,
+            onTogglePin = { onTogglePin(email) },
             onClick = { onEmailClick(email) },
           )
         }
@@ -593,9 +637,9 @@ private fun SearchResultsPane(
   query: String,
   isSearching: Boolean,
   results: List<EmailSummary>,
-  enableFlagForLater: Boolean,
+  enablePinToFeed: Boolean,
   onEmailClick: (EmailSummary) -> Unit,
-  onToggleFlag: (EmailSummary) -> Unit,
+  onTogglePin: (EmailSummary) -> Unit,
   onBackToFeed: () -> Unit,
 ) {
   val surfColors = LocalSurfColors.current
@@ -671,8 +715,8 @@ private fun SearchResultsPane(
           EmailSummaryCard(
             email = email,
             showAccountBadge = true,
-            showFlagAction = enableFlagForLater,
-            onToggleFlag = { onToggleFlag(email) },
+            showPinAction = enablePinToFeed,
+            onTogglePin = { onTogglePin(email) },
             onClick = { onEmailClick(email) },
           )
         }
@@ -685,8 +729,8 @@ private fun SearchResultsPane(
 private fun EmailSummaryCard(
   email: EmailSummary,
   showAccountBadge: Boolean,
-  showFlagAction: Boolean,
-  onToggleFlag: () -> Unit,
+  showPinAction: Boolean,
+  onTogglePin: () -> Unit,
   onClick: () -> Unit,
 ) {
   val surfColors = LocalSurfColors.current
@@ -733,9 +777,9 @@ private fun EmailSummaryCard(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
           )
-          if (showFlagAction && email.isFlagged) {
+          if (showPinAction && email.isFlagged) {
             Text(
-              text = "FLAGGED",
+              text = "Pinned to feed",
               fontFamily = FontFamily.Monospace,
               fontSize = 10.sp,
               fontWeight = FontWeight.Bold,
@@ -755,14 +799,15 @@ private fun EmailSummaryCard(
             fontWeight = FontWeight.Bold,
             color = surfColors.mutedText,
           )
-          if (showFlagAction) {
-            Text(
-              text = if (email.isFlagged) "\u2605" else "\u2606",
-              fontSize = 16.sp,
-              color = if (email.isFlagged) surfColors.progressBlue else surfColors.mutedText,
+          if (showPinAction) {
+            Icon(
+              imageVector = PushPinIcon,
+              contentDescription = if (email.isFlagged) "Unpin from feed" else "Pin to feed",
+              tint = if (email.isFlagged) surfColors.progressBlue else surfColors.mutedText,
               modifier = Modifier
-                .clickable(onClick = onToggleFlag)
-                .padding(horizontal = 4.dp, vertical = 2.dp),
+                .size(18.dp)
+                .clickable(onClick = onTogglePin)
+                .padding(1.dp),
             )
           }
         }
@@ -797,9 +842,9 @@ private fun EmailReaderPane(
   error: String?,
   blockRemoteMedia: Boolean,
   blockExternalImages: Boolean,
-  enableFlagForLater: Boolean,
-  saveContactsFromEmails: Boolean,
-  onToggleFlag: () -> Unit,
+  enablePinToFeed: Boolean,
+  accessDeviceContacts: Boolean,
+  onTogglePin: () -> Unit,
   onSaveSenderContact: () -> Unit,
   onBack: () -> Unit,
   onReply: (EmailDetail) -> Unit,
@@ -808,7 +853,6 @@ private fun EmailReaderPane(
   val surfColors = LocalSurfColors.current
   val context = LocalContext.current
 
-  // Full-screen Email Reader (HM02TopBar and FAB are hidden)
   Column(
     modifier = Modifier
       .fillMaxSize()
@@ -835,12 +879,13 @@ private fun EmailReaderPane(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically,
       ) {
-        if (enableFlagForLater) {
-          IconButton(onClick = onToggleFlag) {
+        if (enablePinToFeed) {
+          IconButton(onClick = onTogglePin) {
             Icon(
-              imageVector = Icons.Default.Star,
-              contentDescription = if (summary.isFlagged) "Unflag Email" else "Flag for Later",
+              imageVector = PushPinIcon,
+              contentDescription = if (summary.isFlagged) "Unpin from feed" else "Pin to feed",
               tint = if (summary.isFlagged) surfColors.progressBlue else surfColors.mutedText,
+              modifier = Modifier.size(20.dp),
             )
           }
         }
@@ -853,7 +898,6 @@ private fun EmailReaderPane(
 
     HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
-    // Unified Full-Screen Block containing both header metadata and the email body
     Column(modifier = Modifier.fillMaxSize()) {
       Column(
         modifier = Modifier
@@ -866,40 +910,40 @@ private fun EmailReaderPane(
           style = MaterialTheme.typography.titleMedium,
           color = surfColors.primaryText,
         )
+
+        // Sender row: when Access Device Contacts is enabled, the sender email is blue and clickable to save the contact.
         Row(
           modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.SpaceBetween,
           verticalAlignment = Alignment.CenterVertically,
         ) {
           Text(
-            text = "From: ${summary.fromName} <${summary.fromAddress}>",
+            text = "From: ${summary.fromName} ",
             style = MaterialTheme.typography.bodySmall,
             color = surfColors.primaryText,
-            modifier = Modifier.weight(1f),
           )
-          if (saveContactsFromEmails) {
-            Text(
-              text = "+ Save Contact",
-              fontFamily = FontFamily.Monospace,
-              fontSize = 11.sp,
-              fontWeight = FontWeight.Bold,
-              color = surfColors.progressBlue,
-              modifier = Modifier
-                .clickable {
-                  onSaveSenderContact()
-                  runCatching {
-                    val intent = Intent(ContactsContract.Intents.Insert.ACTION).apply {
-                      type = ContactsContract.RawContacts.CONTENT_TYPE
-                      putExtra(ContactsContract.Intents.Insert.NAME, summary.fromName)
-                      putExtra(ContactsContract.Intents.Insert.EMAIL, summary.fromAddress)
-                    }
-                    context.startActivity(intent)
+          Text(
+            text = "<${summary.fromAddress}>",
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = if (accessDeviceContacts) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (accessDeviceContacts) surfColors.progressBlue else surfColors.primaryText,
+            modifier = if (accessDeviceContacts) {
+              Modifier.clickable {
+                onSaveSenderContact()
+                runCatching {
+                  val intent = Intent(ContactsContract.Intents.Insert.ACTION).apply {
+                    type = ContactsContract.RawContacts.CONTENT_TYPE
+                    putExtra(ContactsContract.Intents.Insert.NAME, summary.fromName)
+                    putExtra(ContactsContract.Intents.Insert.EMAIL, summary.fromAddress)
                   }
+                  context.startActivity(intent)
                 }
-                .padding(start = 8.dp, top = 2.dp, bottom = 2.dp),
-            )
-          }
+              }
+            } else {
+              Modifier
+            },
+          )
         }
+
         if (detail != null && detail.toAddresses.isNotEmpty()) {
           Text(
             text = "To: ${detail.toAddresses.joinToString(", ")}",
@@ -924,9 +968,9 @@ private fun EmailReaderPane(
             fontSize = 11.5.sp,
             color = surfColors.mutedText,
           )
-          if (enableFlagForLater && summary.isFlagged) {
+          if (enablePinToFeed && summary.isFlagged) {
             Text(
-              text = "\u2605 Flagged on feed",
+              text = "Pinned to feed",
               fontFamily = FontFamily.Monospace,
               fontSize = 11.5.sp,
               fontWeight = FontWeight.Bold,
@@ -1029,6 +1073,11 @@ private fun EmailReaderPane(
   }
 }
 
+/**
+ * Full-screen Reply / Forward / Compose pane matching the exact "blank page" layout and typography
+ * of [EmailReaderPane]: borderless Subject, From (tappable to change sender account), To, and Cc
+ * in the top metadata block, a 1dp divider, and a borderless full-screen message body below.
+ */
 @Composable
 private fun ComposeEmailPane(
   accounts: List<EmailAccount>,
@@ -1042,6 +1091,7 @@ private fun ComposeEmailPane(
 ) {
   val surfColors = LocalSurfColors.current
   var selectedAccount by remember(initialDraft) { mutableStateOf(initialDraft.fromAccount) }
+  var showSenderDropdown by remember { mutableStateOf(false) }
   var to by rememberSaveable(initialDraft) { mutableStateOf(initialDraft.to) }
   var cc by rememberSaveable(initialDraft) { mutableStateOf(initialDraft.cc) }
   var subject by rememberSaveable(initialDraft) { mutableStateOf(initialDraft.subject) }
@@ -1061,17 +1111,17 @@ private fun ComposeEmailPane(
     ComposeMode.FORWARD -> "FORWARD"
   }
 
-  // Full-screen Compose / Reply / Forward pane
   Column(
     modifier = Modifier
       .fillMaxSize()
-      .background(surfColors.pageBg)
-      .verticalScroll(rememberScrollState())
-      .padding(16.dp),
-    verticalArrangement = Arrangement.spacedBy(12.dp),
+      .background(surfColors.cardBg),
   ) {
+    // Top Header Bar matching EmailReaderPane
     Row(
-      modifier = Modifier.fillMaxWidth(),
+      modifier = Modifier
+        .fillMaxWidth()
+        .background(surfColors.headerBg)
+        .padding(horizontal = 10.dp, vertical = 6.dp),
       horizontalArrangement = Arrangement.SpaceBetween,
       verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1088,7 +1138,7 @@ private fun ComposeEmailPane(
         text = modeLabel,
         fontFamily = FontFamily.Monospace,
         fontWeight = FontWeight.Bold,
-        fontSize = 13.sp,
+        fontSize = 12.5.sp,
         color = surfColors.secondaryText,
       )
       SurfPillButton(
@@ -1109,190 +1159,262 @@ private fun ComposeEmailPane(
       )
     }
 
-    if (accounts.size > 1) {
-      Text(
-        text = "SEND FROM",
-        fontFamily = FontFamily.Monospace,
-        fontWeight = FontWeight.Bold,
-        fontSize = 11.sp,
-        color = surfColors.mutedText,
-      )
-      Column(
-        modifier = Modifier
-          .fillMaxWidth()
-          .clip(RoundedCornerShape(12.dp))
-          .border(1.dp, surfColors.cardStroke, RoundedCornerShape(12.dp))
-          .background(surfColors.cardBg),
-      ) {
-        accounts.forEachIndexed { index, account ->
-          val isSelected = account.id == selectedAccount.id
-          Row(
-            modifier = Modifier
-              .fillMaxWidth()
-              .clickable { selectedAccount = account }
-              .padding(horizontal = 14.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-          ) {
-            Text(
-              text = account.emailAddress,
-              fontFamily = FontFamily.Monospace,
-              fontSize = 12.5.sp,
-              fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-              color = surfColors.primaryText,
-            )
-            if (isSelected) {
-              Icon(
-                imageVector = Icons.Default.Check,
-                contentDescription = "Selected",
-                tint = surfColors.primaryText,
-                modifier = Modifier.size(16.dp),
+    HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+
+    // Unified Metadata Block matching EmailReaderPane (borderless Subject, From, To, Cc)
+    Column(
+      modifier = Modifier
+        .fillMaxWidth()
+        .padding(horizontal = 18.dp, vertical = 16.dp),
+      verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+      // Borderless Subject line matching Reader's titleMedium
+      BasicTextField(
+        value = subject,
+        onValueChange = {
+          subject = it
+          onClearContactSuggestions()
+        },
+        singleLine = true,
+        textStyle = MaterialTheme.typography.titleMedium.copy(
+          color = surfColors.primaryText,
+        ),
+        cursorBrush = SolidColor(surfColors.primaryText),
+        modifier = Modifier.fillMaxWidth(),
+        decorationBox = { innerTextField ->
+          Box(modifier = Modifier.fillMaxWidth()) {
+            if (subject.isEmpty()) {
+              Text(
+                text = "Subject",
+                style = MaterialTheme.typography.titleMedium,
+                color = surfColors.mutedText,
               )
             }
+            innerTextField()
           }
-          if (index < accounts.lastIndex) {
-            HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
-          }
-        }
-      }
-    } else {
-      Text(
-        text = "From: ${selectedAccount.emailAddress}",
-        fontFamily = FontFamily.Monospace,
-        fontSize = 12.sp,
-        color = surfColors.secondaryText,
+        },
       )
-    }
 
-    SurfInputField(
-      value = to,
-      onValueChange = {
-        to = it
-        activeRecipientField = "to"
-        onContactQueryChange(it)
-      },
-      hint = "To (comma-separated email addresses)",
-      singleLine = true,
-      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-    )
-
-    SurfInputField(
-      value = cc,
-      onValueChange = {
-        cc = it
-        activeRecipientField = "cc"
-        onContactQueryChange(it)
-      },
-      hint = "Cc (optional)",
-      singleLine = true,
-      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-    )
-
-    if (contactSuggestions.isNotEmpty()) {
-      Column(
+      // Tappable "From:" row to switch sender account on New, Reply, or Forward
+      Row(
         modifier = Modifier
           .fillMaxWidth()
-          .clip(RoundedCornerShape(12.dp))
-          .border(1.dp, surfColors.cardStroke, RoundedCornerShape(12.dp))
-          .background(surfColors.cardBg),
+          .clickable(enabled = accounts.size > 1) {
+            showSenderDropdown = !showSenderDropdown
+          },
+        verticalAlignment = Alignment.CenterVertically,
       ) {
-        contactSuggestions.forEachIndexed { index, suggestion ->
-          Row(
-            modifier = Modifier
-              .fillMaxWidth()
-              .clickable {
-                if (activeRecipientField == "cc") {
-                  cc = replaceLastRecipientToken(cc, suggestion.formatted)
-                } else {
-                  to = replaceLastRecipientToken(to, suggestion.formatted)
+        Text(
+          text = "From: ${selectedAccount.displayName.ifBlank { selectedAccount.emailAddress }} ",
+          style = MaterialTheme.typography.bodySmall,
+          color = surfColors.primaryText,
+        )
+        Text(
+          text = if (accounts.size > 1) "<${selectedAccount.emailAddress}> \u25BE" else "<${selectedAccount.emailAddress}>",
+          style = MaterialTheme.typography.bodySmall,
+          fontWeight = if (accounts.size > 1) FontWeight.SemiBold else FontWeight.Normal,
+          color = if (accounts.size > 1) surfColors.progressBlue else surfColors.primaryText,
+        )
+      }
+
+      if (showSenderDropdown && accounts.size > 1) {
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        ) {
+          accounts.forEach { account ->
+            val isSelected = account.id == selectedAccount.id
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                  selectedAccount = account
+                  showSenderDropdown = false
                 }
-                onClearContactSuggestions()
-              }
-              .padding(horizontal = 14.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-          ) {
-            Column(modifier = Modifier.weight(1f)) {
-              if (suggestion.name.isNotBlank()) {
-                Text(
-                  text = suggestion.name,
-                  fontSize = 13.5.sp,
-                  fontWeight = FontWeight.SemiBold,
-                  color = surfColors.primaryText,
+                .padding(vertical = 6.dp),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Text(
+                text = "${account.displayName.ifBlank { account.emailAddress }} <${account.emailAddress}>",
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                color = if (isSelected) surfColors.progressBlue else surfColors.secondaryText,
+              )
+              if (isSelected) {
+                Icon(
+                  imageVector = Icons.Default.Check,
+                  contentDescription = "Selected",
+                  tint = surfColors.progressBlue,
+                  modifier = Modifier.size(15.dp),
                 )
               }
+            }
+          }
+        }
+      }
+
+      // Borderless inline "To:" row matching Reader's "To: ..."
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Text(
+          text = "To: ",
+          style = MaterialTheme.typography.bodySmall,
+          color = surfColors.secondaryText,
+        )
+        BasicTextField(
+          value = to,
+          onValueChange = {
+            to = it
+            activeRecipientField = "to"
+            onContactQueryChange(it)
+          },
+          singleLine = true,
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+          textStyle = MaterialTheme.typography.bodySmall.copy(
+            color = surfColors.primaryText,
+          ),
+          cursorBrush = SolidColor(surfColors.primaryText),
+          modifier = Modifier.weight(1f),
+          decorationBox = { innerTextField ->
+            Box(modifier = Modifier.fillMaxWidth()) {
+              if (to.isEmpty()) {
+                Text(
+                  text = "recipient@example.com",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = surfColors.mutedText,
+                )
+              }
+              innerTextField()
+            }
+          },
+        )
+      }
+
+      // Borderless inline "Cc:" row matching Reader's "Cc: ..."
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Text(
+          text = "Cc: ",
+          style = MaterialTheme.typography.bodySmall,
+          color = surfColors.secondaryText,
+        )
+        BasicTextField(
+          value = cc,
+          onValueChange = {
+            cc = it
+            activeRecipientField = "cc"
+            onContactQueryChange(it)
+          },
+          singleLine = true,
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+          textStyle = MaterialTheme.typography.bodySmall.copy(
+            color = surfColors.primaryText,
+          ),
+          cursorBrush = SolidColor(surfColors.primaryText),
+          modifier = Modifier.weight(1f),
+          decorationBox = { innerTextField ->
+            Box(modifier = Modifier.fillMaxWidth()) {
+              if (cc.isEmpty()) {
+                Text(
+                  text = "optional",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = surfColors.mutedText,
+                )
+              }
+              innerTextField()
+            }
+          },
+        )
+      }
+
+      if (contactSuggestions.isNotEmpty()) {
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+        Column(modifier = Modifier.fillMaxWidth()) {
+          contactSuggestions.forEach { suggestion ->
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                  if (activeRecipientField == "cc") {
+                    cc = replaceLastRecipientToken(cc, suggestion.formatted)
+                  } else {
+                    to = replaceLastRecipientToken(to, suggestion.formatted)
+                  }
+                  onClearContactSuggestions()
+                }
+                .padding(vertical = 6.dp),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
               Text(
-                text = suggestion.emailAddress,
+                text = suggestion.formatted,
+                style = MaterialTheme.typography.bodySmall,
+                color = surfColors.progressBlue,
+              )
+              Text(
+                text = suggestion.source.uppercase(Locale.US),
                 fontFamily = FontFamily.Monospace,
-                fontSize = 12.sp,
-                color = surfColors.secondaryText,
+                fontSize = 10.sp,
+                color = surfColors.mutedText,
               )
             }
-            Text(
-              text = suggestion.source.uppercase(Locale.US),
-              fontFamily = FontFamily.Monospace,
-              fontSize = 10.sp,
-              color = surfColors.mutedText,
-            )
-          }
-          if (index < contactSuggestions.lastIndex) {
-            HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
           }
         }
       }
     }
 
-    SurfInputField(
-      value = subject,
-      onValueChange = {
-        subject = it
-        onClearContactSuggestions()
-      },
-      hint = "Subject",
-      singleLine = true,
+    HorizontalDivider(
+      thickness = 1.dp,
+      color = surfColors.cardStroke,
+      modifier = Modifier.padding(horizontal = 18.dp),
     )
 
+    // Full-screen borderless message body matching EmailReaderPane's body area
     BasicTextField(
       value = bodyField,
       onValueChange = { bodyField = it },
-      textStyle = TextStyle(
+      textStyle = MaterialTheme.typography.bodyMedium.copy(
         color = surfColors.primaryText,
-        fontSize = 14.sp,
-        fontFamily = FontFamily.SansSerif,
+        lineHeight = 22.sp,
       ),
       cursorBrush = SolidColor(surfColors.primaryText),
-      modifier = Modifier.fillMaxWidth(),
+      modifier = Modifier
+        .fillMaxSize()
+        .verticalScroll(rememberScrollState())
+        .padding(18.dp),
       decorationBox = { innerTextField ->
-        Box(
-          modifier = Modifier
-            .fillMaxWidth()
-            .background(surfColors.inputBg, RoundedCornerShape(12.dp))
-            .border(1.dp, surfColors.inputStroke, RoundedCornerShape(12.dp))
-            .padding(horizontal = 14.dp, vertical = 12.dp),
-          contentAlignment = Alignment.TopStart,
-        ) {
+        Box(modifier = Modifier.fillMaxSize()) {
           if (bodyField.text.isEmpty()) {
             Text(
               text = "Write your message...",
-              color = surfColors.secondaryText,
-              fontSize = 14.sp,
+              style = MaterialTheme.typography.bodyMedium,
+              color = surfColors.mutedText,
             )
           }
-          Box(modifier = Modifier.height(340.dp)) {
-            innerTextField()
-          }
+          innerTextField()
         }
       },
     )
   }
 }
 
+/**
+ * Full-screen Settings page with "blank page" vibes matching [EmailReaderPane],
+ * containing only the two toggle options without helper text:
+ * 1. Access Device Contacts
+ * 2. Enable Pin to Feed
+ */
 @Composable
 private fun SettingsPane(
   uiState: HM02UiState,
   onToggleAccessContacts: (Boolean) -> Unit,
-  onToggleSaveContactsFromEmails: (Boolean) -> Unit,
-  onToggleFlagForLater: (Boolean) -> Unit,
+  onTogglePinToFeed: (Boolean) -> Unit,
   onContactsPermissionResult: (Boolean) -> Unit,
   onBack: () -> Unit,
 ) {
@@ -1307,12 +1429,13 @@ private fun SettingsPane(
   Column(
     modifier = Modifier
       .fillMaxSize()
-      .verticalScroll(rememberScrollState())
-      .padding(16.dp),
-    verticalArrangement = Arrangement.spacedBy(14.dp),
+      .background(surfColors.cardBg),
   ) {
     Row(
-      modifier = Modifier.fillMaxWidth(),
+      modifier = Modifier
+        .fillMaxWidth()
+        .background(surfColors.headerBg)
+        .padding(horizontal = 10.dp, vertical = 6.dp),
       horizontalArrangement = Arrangement.SpaceBetween,
       verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1329,39 +1452,32 @@ private fun SettingsPane(
         text = "SETTINGS",
         fontFamily = FontFamily.Monospace,
         fontWeight = FontWeight.Bold,
-        fontSize = 13.5.sp,
+        fontSize = 13.sp,
         color = surfColors.primaryText,
+        modifier = Modifier.padding(end = 8.dp),
       )
     }
 
-    Text(
-      text = "CONTACTS & AUTOCOMPLETE",
-      fontFamily = FontFamily.Monospace,
-      fontWeight = FontWeight.Bold,
-      fontSize = 11.5.sp,
-      color = surfColors.mutedText,
-    )
+    HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
-    SurfCard(modifier = Modifier.fillMaxWidth(), padding = 16.dp) {
+    Column(
+      modifier = Modifier
+        .fillMaxSize()
+        .verticalScroll(rememberScrollState())
+        .padding(horizontal = 18.dp),
+    ) {
       Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(vertical = 16.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
       ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-          Text(
-            text = "Access Device Contacts",
-            style = MaterialTheme.typography.bodyLarge,
-            fontWeight = FontWeight.SemiBold,
-            color = surfColors.primaryText,
-          )
-          Spacer(modifier = Modifier.height(4.dp))
-          Text(
-            text = "Suggest email addresses from your phone's default Contacts app when composing or forwarding.",
-            style = MaterialTheme.typography.bodySmall,
-            color = surfColors.secondaryText,
-          )
-        }
+        Text(
+          text = "Access Device Contacts",
+          style = MaterialTheme.typography.bodyLarge,
+          color = surfColors.primaryText,
+        )
         Switch(
           checked = settings.accessDeviceContacts,
           onCheckedChange = { enabled ->
@@ -1378,102 +1494,38 @@ private fun SettingsPane(
         )
       }
 
-      HorizontalDivider(
-        thickness = 1.dp,
-        color = surfColors.cardStroke,
-        modifier = Modifier.padding(vertical = 14.dp),
-      )
+      HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
       Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(vertical = 16.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
       ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-          Text(
-            text = "Save Contacts from Emails",
-            style = MaterialTheme.typography.bodyLarge,
-            fontWeight = FontWeight.SemiBold,
-            color = surfColors.primaryText,
-          )
-          Spacer(modifier = Modifier.height(4.dp))
-          Text(
-            text = "Remember sender and recipient addresses from emails you read or send (${uiState.savedContactsCount} saved), plus show '+ Save Contact' inside emails.",
-            style = MaterialTheme.typography.bodySmall,
-            color = surfColors.secondaryText,
-          )
-        }
+        Text(
+          text = "Enable Pin to Feed",
+          style = MaterialTheme.typography.bodyLarge,
+          color = surfColors.primaryText,
+        )
         Switch(
-          checked = settings.saveContactsFromEmails,
-          onCheckedChange = onToggleSaveContactsFromEmails,
+          checked = settings.enablePinToFeed,
+          onCheckedChange = onTogglePinToFeed,
           colors = SwitchDefaults.colors(
             checkedThumbColor = surfColors.activePillText,
             checkedTrackColor = surfColors.activePillBg,
           ),
         )
       }
-    }
 
-    Text(
-      text = "FEED & FLAGGING",
-      fontFamily = FontFamily.Monospace,
-      fontWeight = FontWeight.Bold,
-      fontSize = 11.5.sp,
-      color = surfColors.mutedText,
-    )
-
-    SurfCard(modifier = Modifier.fillMaxWidth(), padding = 16.dp) {
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-      ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-          Text(
-            text = "Flag Emails for Later",
-            style = MaterialTheme.typography.bodyLarge,
-            fontWeight = FontWeight.SemiBold,
-            color = surfColors.primaryText,
-          )
-          Spacer(modifier = Modifier.height(4.dp))
-          Text(
-            text = "Pin flagged emails (\u2605) so they stay saved on your main feed even after the 10-minute window expires (${uiState.flaggedEmailsCount} flagged).",
-            style = MaterialTheme.typography.bodySmall,
-            color = surfColors.secondaryText,
-          )
-        }
-        Switch(
-          checked = settings.enableFlagForLater,
-          onCheckedChange = onToggleFlagForLater,
-          colors = SwitchDefaults.colors(
-            checkedThumbColor = surfColors.activePillText,
-            checkedTrackColor = surfColors.activePillBg,
-          ),
-        )
-      }
-    }
-
-    Text(
-      text = "SEARCH SHORTCUTS",
-      fontFamily = FontFamily.Monospace,
-      fontWeight = FontWeight.Bold,
-      fontSize = 11.5.sp,
-      color = surfColors.mutedText,
-    )
-
-    SurfCard(modifier = Modifier.fillMaxWidth(), padding = 16.dp) {
-      Text(
-        text = "\u2022 Search \"a\" \u2192 All emails received today\n" +
-          "\u2022 Search \"a2\" \u2192 All emails from yesterday and today\n" +
-          "\u2022 Search \"a7\" \u2192 All emails from the last 7 days",
-        fontFamily = FontFamily.Monospace,
-        fontSize = 12.sp,
-        color = surfColors.secondaryText,
-      )
+      HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
     }
   }
 }
 
+/**
+ * Full-screen Accounts page with "blank page" vibes matching [EmailReaderPane].
+ */
 @Composable
 private fun AccountsManagerPane(
   accounts: List<EmailAccount>,
@@ -1485,8 +1537,6 @@ private fun AccountsManagerPane(
   val context = LocalContext.current
   val surfColors = LocalSurfColors.current
 
-  // Show the Add Account form automatically only if no accounts exist yet;
-  // otherwise toggle it via the (+) icon button next to EMAIL ACCOUNTS (N).
   var isAddingAccount by rememberSaveable(accounts.isEmpty()) {
     mutableStateOf(accounts.isEmpty())
   }
@@ -1502,12 +1552,13 @@ private fun AccountsManagerPane(
   Column(
     modifier = Modifier
       .fillMaxSize()
-      .verticalScroll(rememberScrollState())
-      .padding(16.dp),
-    verticalArrangement = Arrangement.spacedBy(14.dp),
+      .background(surfColors.cardBg),
   ) {
     Row(
-      modifier = Modifier.fillMaxWidth(),
+      modifier = Modifier
+        .fillMaxWidth()
+        .background(surfColors.headerBg)
+        .padding(horizontal = 10.dp, vertical = 6.dp),
       horizontalArrangement = Arrangement.SpaceBetween,
       verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1523,13 +1574,13 @@ private fun AccountsManagerPane(
 
       Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
       ) {
         Text(
           text = "EMAIL ACCOUNTS (${accounts.size})",
           fontFamily = FontFamily.Monospace,
           fontWeight = FontWeight.Bold,
-          fontSize = 13.5.sp,
+          fontSize = 13.sp,
           color = surfColors.primaryText,
         )
         IconButton(onClick = { isAddingAccount = !isAddingAccount }) {
@@ -1542,63 +1593,60 @@ private fun AccountsManagerPane(
       }
     }
 
-    if (accounts.isNotEmpty()) {
+    HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+
+    Column(
+      modifier = Modifier
+        .fillMaxSize()
+        .verticalScroll(rememberScrollState())
+        .padding(horizontal = 18.dp),
+    ) {
       accounts.forEach { account ->
-        SurfCard(modifier = Modifier.fillMaxWidth(), padding = 14.dp) {
-          Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-          ) {
-            Column(modifier = Modifier.weight(1f)) {
-              Text(
-                text = account.displayName.ifBlank { account.emailAddress },
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.SemiBold,
-                color = surfColors.primaryText,
-              )
-              Text(
-                text = "${account.emailAddress} • ${account.imapHost}",
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.5.sp,
-                color = surfColors.secondaryText,
-              )
-            }
-            TextButton(onClick = { onRemoveAccount(account.id) }) {
-              Text(
-                text = "Remove",
-                color = surfColors.alertRed,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
-              )
-            }
+        Row(
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 14.dp),
+          horizontalArrangement = Arrangement.SpaceBetween,
+          verticalAlignment = Alignment.CenterVertically,
+        ) {
+          Column(modifier = Modifier.weight(1f)) {
+            Text(
+              text = account.displayName.ifBlank { account.emailAddress },
+              style = MaterialTheme.typography.bodyLarge,
+              fontWeight = FontWeight.SemiBold,
+              color = surfColors.primaryText,
+            )
+            Text(
+              text = "${account.emailAddress} • ${account.imapHost}",
+              fontFamily = FontFamily.Monospace,
+              fontSize = 11.5.sp,
+              color = surfColors.secondaryText,
+            )
+          }
+          TextButton(onClick = { onRemoveAccount(account.id) }) {
+            Text(
+              text = "Remove",
+              color = surfColors.alertRed,
+              fontSize = 13.sp,
+              fontWeight = FontWeight.SemiBold,
+            )
           }
         }
-      }
-    }
-
-    if (isAddingAccount) {
-      if (accounts.isNotEmpty()) {
         HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
       }
 
-      Text(
-        text = "SELECT EMAIL PROVIDER",
-        fontFamily = FontFamily.Monospace,
-        fontWeight = FontWeight.Bold,
-        fontSize = 11.5.sp,
-        color = surfColors.mutedText,
-      )
+      if (isAddingAccount) {
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+          text = "SELECT EMAIL PROVIDER",
+          fontFamily = FontFamily.Monospace,
+          fontWeight = FontWeight.Bold,
+          fontSize = 11.5.sp,
+          color = surfColors.mutedText,
+        )
+        Spacer(modifier = Modifier.height(6.dp))
 
-      // Vertical Provider List including "Other (Custom IMAP / SMTP)" at the end
-      Column(
-        modifier = Modifier
-          .fillMaxWidth()
-          .clip(RoundedCornerShape(14.dp))
-          .border(1.dp, surfColors.cardStroke, RoundedCornerShape(14.dp))
-          .background(surfColors.cardBg),
-      ) {
-        MailProviderPreset.entries.forEachIndexed { index, preset ->
+        MailProviderPreset.entries.forEach { preset ->
           val isSelected = selectedPreset == preset
           Row(
             modifier = Modifier
@@ -1610,7 +1658,7 @@ private fun AccountsManagerPane(
                 smtpHost = preset.smtpHost
                 smtpPort = preset.smtpPort.toString()
               }
-              .padding(horizontal = 14.dp, vertical = 12.dp),
+              .padding(vertical = 10.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
           ) {
@@ -1624,18 +1672,15 @@ private fun AccountsManagerPane(
               Icon(
                 imageVector = Icons.Default.Check,
                 contentDescription = "Selected",
-                tint = surfColors.primaryText,
+                tint = surfColors.progressBlue,
                 modifier = Modifier.size(18.dp),
               )
             }
           }
-          if (index < MailProviderPreset.entries.lastIndex) {
-            HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
-          }
+          HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
         }
-      }
 
-      SurfCard(modifier = Modifier.fillMaxWidth(), padding = 16.dp) {
+        Spacer(modifier = Modifier.height(12.dp))
         Text(
           text = selectedPreset.setupHint,
           style = MaterialTheme.typography.bodySmall,
@@ -1643,94 +1688,92 @@ private fun AccountsManagerPane(
         )
         val url = selectedPreset.appPasswordUrl
         if (url != null) {
-          Spacer(modifier = Modifier.height(10.dp))
-          SurfPillButton(
-            label = "Open ${selectedPreset.label} App Passwords \u2197",
-            onClick = {
+          Spacer(modifier = Modifier.height(6.dp))
+          Text(
+            text = "Open ${selectedPreset.label} App Passwords \u2197",
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.SemiBold,
+            color = surfColors.progressBlue,
+            modifier = Modifier.clickable {
               runCatching {
                 context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
               }
             },
           )
         }
-      }
 
-      SurfInputField(
-        value = displayName,
-        onValueChange = { displayName = it },
-        hint = "Display Name (e.g. Work, Personal)",
-        singleLine = true,
-      )
+        Spacer(modifier = Modifier.height(12.dp))
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
-      SurfInputField(
-        value = emailAddress,
-        onValueChange = { emailAddress = it },
-        hint = "Email Address (you@example.com)",
-        singleLine = true,
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-      )
+        BlankPageFieldRow(
+          label = "Name: ",
+          value = displayName,
+          onValueChange = { displayName = it },
+          placeholder = "Work, Personal",
+        )
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
-      SurfInputField(
-        value = appPassword,
-        onValueChange = { appPassword = it },
-        hint = "16-Character App Password",
-        singleLine = true,
-        isPassword = true,
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-      )
+        BlankPageFieldRow(
+          label = "Email: ",
+          value = emailAddress,
+          onValueChange = { emailAddress = it },
+          placeholder = "you@example.com",
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+        )
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-      ) {
-        SurfInputField(
+        BlankPageFieldRow(
+          label = "App Password: ",
+          value = appPassword,
+          onValueChange = { appPassword = it },
+          placeholder = "16-character password",
+          isPassword = true,
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+        )
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+
+        BlankPageFieldRow(
+          label = "IMAP Host: ",
           value = imapHost,
           onValueChange = { imapHost = it },
-          hint = "IMAP Host",
-          singleLine = true,
-          modifier = Modifier.weight(2f),
+          placeholder = "imap.example.com",
         )
-        SurfInputField(
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+
+        BlankPageFieldRow(
+          label = "IMAP Port: ",
           value = imapPort,
           onValueChange = { imapPort = it },
-          hint = "IMAP Port",
-          singleLine = true,
-          modifier = Modifier.weight(1f),
+          placeholder = "993",
           keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         )
-      }
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-      ) {
-        SurfInputField(
+        BlankPageFieldRow(
+          label = "SMTP Host: ",
           value = smtpHost,
           onValueChange = { smtpHost = it },
-          hint = "SMTP Host",
-          singleLine = true,
-          modifier = Modifier.weight(2f),
+          placeholder = "smtp.example.com",
         )
-        SurfInputField(
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+
+        BlankPageFieldRow(
+          label = "SMTP Port: ",
           value = smtpPort,
           onValueChange = { smtpPort = it },
-          hint = "SMTP Port",
-          singleLine = true,
-          modifier = Modifier.weight(1f),
+          placeholder = "465",
           keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         )
-      }
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
-      val canSubmit = !isVerifying &&
-        emailAddress.isNotBlank() &&
-        appPassword.isNotBlank() &&
-        imapHost.isNotBlank() &&
-        smtpHost.isNotBlank()
+        Spacer(modifier = Modifier.height(16.dp))
 
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-      ) {
+        val canSubmit = !isVerifying &&
+          emailAddress.isNotBlank() &&
+          appPassword.isNotBlank() &&
+          imapHost.isNotBlank() &&
+          smtpHost.isNotBlank()
+
         SurfPillButton(
           label = if (isVerifying) "Verifying..." else "Verify & Add Account",
           isPrimary = true,
@@ -1749,8 +1792,59 @@ private fun AccountsManagerPane(
             isAddingAccount = false
           },
         )
+        Spacer(modifier = Modifier.height(24.dp))
       }
     }
+  }
+}
+
+@Composable
+private fun BlankPageFieldRow(
+  label: String,
+  value: String,
+  onValueChange: (String) -> Unit,
+  placeholder: String,
+  isPassword: Boolean = false,
+  keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+) {
+  val surfColors = LocalSurfColors.current
+  val visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None
+
+  Row(
+    modifier = Modifier
+      .fillMaxWidth()
+      .padding(vertical = 12.dp),
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    Text(
+      text = label,
+      style = MaterialTheme.typography.bodySmall,
+      color = surfColors.secondaryText,
+    )
+    BasicTextField(
+      value = value,
+      onValueChange = onValueChange,
+      singleLine = true,
+      visualTransformation = visualTransformation,
+      keyboardOptions = keyboardOptions,
+      textStyle = MaterialTheme.typography.bodySmall.copy(
+        color = surfColors.primaryText,
+      ),
+      cursorBrush = SolidColor(surfColors.primaryText),
+      modifier = Modifier.weight(1f),
+      decorationBox = { innerTextField ->
+        Box(modifier = Modifier.fillMaxWidth()) {
+          if (value.isEmpty()) {
+            Text(
+              text = placeholder,
+              style = MaterialTheme.typography.bodySmall,
+              color = surfColors.mutedText,
+            )
+          }
+          innerTextField()
+        }
+      },
+    )
   }
 }
 
@@ -1791,62 +1885,6 @@ fun SurfPillButton(
       modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp),
     )
   }
-}
-
-@Composable
-fun SurfInputField(
-  value: String,
-  onValueChange: (String) -> Unit,
-  hint: String,
-  modifier: Modifier = Modifier,
-  singleLine: Boolean = true,
-  isPassword: Boolean = false,
-  minHeight: Dp = 44.dp,
-  keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
-  keyboardActions: KeyboardActions = KeyboardActions.Default,
-) {
-  val surfColors = LocalSurfColors.current
-  val visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None
-
-  BasicTextField(
-    value = value,
-    onValueChange = onValueChange,
-    singleLine = singleLine,
-    visualTransformation = visualTransformation,
-    keyboardOptions = keyboardOptions,
-    keyboardActions = keyboardActions,
-    textStyle = TextStyle(
-      color = surfColors.primaryText,
-      fontSize = 14.sp,
-      fontFamily = FontFamily.SansSerif,
-    ),
-    cursorBrush = SolidColor(surfColors.primaryText),
-    modifier = modifier.fillMaxWidth(),
-    decorationBox = { innerTextField ->
-      Box(
-        modifier = Modifier
-          .fillMaxWidth()
-          .height(if (singleLine) minHeight else Dp.Unspecified)
-          .background(surfColors.inputBg, RoundedCornerShape(12.dp))
-          .border(1.dp, surfColors.inputStroke, RoundedCornerShape(12.dp))
-          .padding(horizontal = 14.dp, vertical = 11.dp),
-        contentAlignment = if (singleLine) Alignment.CenterStart else Alignment.TopStart,
-      ) {
-        if (value.isEmpty()) {
-          Text(
-            text = hint,
-            color = surfColors.secondaryText,
-            fontSize = 14.sp,
-          )
-        }
-        Box(
-          modifier = if (!singleLine) Modifier.height(minHeight) else Modifier,
-        ) {
-          innerTextField()
-        }
-      }
-    },
-  )
 }
 
 @Composable

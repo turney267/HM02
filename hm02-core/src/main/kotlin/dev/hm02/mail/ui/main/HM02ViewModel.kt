@@ -101,7 +101,7 @@ class HM02ViewModel(
             feedItems = mergeFeedWithFlagged(
               syncedItems = latestSyncedFeedItems,
               flaggedItems = settingsAndContactsStore.flaggedEmails.value,
-              enableFlagForLater = updatedSettings.enableFlagForLater,
+              enablePinToFeed = updatedSettings.enablePinToFeed,
             ),
           )
         }
@@ -115,7 +115,7 @@ class HM02ViewModel(
             feedItems = mergeFeedWithFlagged(
               syncedItems = latestSyncedFeedItems,
               flaggedItems = flaggedList,
-              enableFlagForLater = state.settings.enableFlagForLater,
+              enablePinToFeed = state.settings.enablePinToFeed,
             ),
           )
         }
@@ -168,7 +168,7 @@ class HM02ViewModel(
           feedItems = mergeFeedWithFlagged(
             syncedItems = latestSyncedFeedItems,
             flaggedItems = settingsAndContactsStore.flaggedEmails.value,
-            enableFlagForLater = state.settings.enableFlagForLater,
+            enablePinToFeed = state.settings.enablePinToFeed,
           ),
           failedAccountSyncs = failures,
           isRefreshingFeed = false,
@@ -269,12 +269,8 @@ class HM02ViewModel(
     refreshContactsPermissionState()
   }
 
-  fun updateSaveContactsFromEmails(enabled: Boolean) {
-    settingsAndContactsStore.updateSettings { it.copy(saveContactsFromEmails = enabled) }
-  }
-
-  fun updateEnableFlagForLater(enabled: Boolean) {
-    settingsAndContactsStore.updateSettings { it.copy(enableFlagForLater = enabled) }
+  fun updateEnablePinToFeed(enabled: Boolean) {
+    settingsAndContactsStore.updateSettings { it.copy(enablePinToFeed = enabled) }
   }
 
   fun toggleFlagged(email: EmailSummary) {
@@ -301,13 +297,13 @@ class HM02ViewModel(
         feedItems = mergeFeedWithFlagged(
           syncedItems = latestSyncedFeedItems,
           flaggedItems = settingsAndContactsStore.flaggedEmails.value,
-          enableFlagForLater = state.settings.enableFlagForLater,
+          enablePinToFeed = state.settings.enablePinToFeed,
         ),
         searchResults = state.searchResults.map {
           if (it.compositeKey == email.compositeKey) it.copy(isFlagged = nowFlagged) else it
         },
         activePane = updatedPane,
-        statusMessage = if (nowFlagged) "Flagged for later (saved to feed)" else "Removed flag",
+        statusMessage = if (nowFlagged) "Pinned to feed" else "Unpinned from feed",
       )
     }
 
@@ -376,7 +372,7 @@ class HM02ViewModel(
               feedItems = mergeFeedWithFlagged(
                 syncedItems = latestSyncedFeedItems,
                 flaggedItems = settingsAndContactsStore.flaggedEmails.value,
-                enableFlagForLater = state.settings.enableFlagForLater,
+                enablePinToFeed = state.settings.enablePinToFeed,
               ),
               searchResults = state.searchResults.map {
                 if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
@@ -571,9 +567,9 @@ class HM02ViewModel(
   private fun mergeFeedWithFlagged(
     syncedItems: List<EmailSummary>,
     flaggedItems: List<EmailSummary>,
-    enableFlagForLater: Boolean,
+    enablePinToFeed: Boolean,
   ): List<EmailSummary> {
-    if (!enableFlagForLater || flaggedItems.isEmpty()) {
+    if (!enablePinToFeed || flaggedItems.isEmpty()) {
       return syncedItems.map { it.copy(isFlagged = false) }
     }
     val flaggedByKey = flaggedItems.associateBy { it.compositeKey }

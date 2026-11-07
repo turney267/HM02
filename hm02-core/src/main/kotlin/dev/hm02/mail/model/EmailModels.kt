@@ -148,13 +148,12 @@ data class OutgoingEmailDraft(
 )
 
 /**
- * User-configurable settings for Contacts and Flagging emails for later.
+ * User-configurable settings for Contacts (autocomplete + saving contacts) and Pin to Feed.
  */
 @Serializable
 data class UserSettings(
   val accessDeviceContacts: Boolean = false,
-  val saveContactsFromEmails: Boolean = false,
-  val enableFlagForLater: Boolean = false,
+  val enablePinToFeed: Boolean = false,
 )
 
 /**
