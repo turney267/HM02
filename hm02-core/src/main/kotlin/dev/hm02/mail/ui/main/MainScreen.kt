@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -60,6 +61,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -240,6 +242,7 @@ fun HM02AppScreen(
             uiState = uiState,
             onEmailClick = viewModel::openMessage,
             onTogglePin = viewModel::toggleFlagged,
+            onRefresh = viewModel::refreshFeed,
             onAddAccountClick = viewModel::showAccounts,
           )
         }
@@ -479,11 +482,13 @@ private fun HM02TopBar(
   }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FeedPane(
   uiState: HM02UiState,
   onEmailClick: (EmailSummary) -> Unit,
   onTogglePin: (EmailSummary) -> Unit,
+  onRefresh: () -> Unit,
   onAddAccountClick: () -> Unit,
 ) {
   val surfColors = LocalSurfColors.current
@@ -500,15 +505,18 @@ private fun FeedPane(
     Box(
       modifier = Modifier
         .fillMaxSize()
+        .background(surfColors.cardBg)
         .padding(24.dp),
       contentAlignment = Alignment.Center,
     ) {
-      SurfCard(modifier = Modifier.fillMaxWidth()) {
+      Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+      ) {
         Text(
           text = "No Email Accounts Configured",
           style = MaterialTheme.typography.titleMedium,
           color = surfColors.primaryText,
-          modifier = Modifier.fillMaxWidth(),
           textAlign = TextAlign.Center,
         )
         Spacer(modifier = Modifier.height(10.dp))
@@ -516,69 +524,99 @@ private fun FeedPane(
           text = "Connect Gmail, Outlook, iCloud, Yahoo, Fastmail, or custom IMAP/SMTP using an App Password.",
           style = MaterialTheme.typography.bodyMedium,
           color = surfColors.secondaryText,
-          modifier = Modifier.fillMaxWidth(),
           textAlign = TextAlign.Center,
         )
         Spacer(modifier = Modifier.height(18.dp))
-        Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-          SurfPillButton(
-            label = "Add Email Account",
-            isPrimary = true,
-            onClick = onAddAccountClick,
-          )
-        }
+        SurfPillButton(
+          label = "Add Email Account",
+          isPrimary = true,
+          onClick = onAddAccountClick,
+        )
       }
     }
     return
   }
 
-  Column(modifier = Modifier.fillMaxSize()) {
-    FeedStatusHeader(
-      lastRefreshedAtMillis = uiState.lastRefreshedAtMillis,
-      currentClockMillis = currentClockMillis,
-      isRefreshing = uiState.isRefreshingFeed,
-      failedAccountSyncs = uiState.failedAccountSyncs,
-      totalAccountCount = uiState.accounts.size,
-    )
-
+  PullToRefreshBox(
+    isRefreshing = uiState.isRefreshingFeed,
+    onRefresh = onRefresh,
+    modifier = Modifier
+      .fillMaxSize()
+      .background(surfColors.cardBg),
+  ) {
     if (uiState.feedItems.isEmpty() && !uiState.isRefreshingFeed) {
-      Box(
+      Column(
         modifier = Modifier
           .fillMaxSize()
-          .padding(24.dp),
-        contentAlignment = Alignment.Center,
+          .verticalScroll(rememberScrollState()),
       ) {
-        SurfCard(modifier = Modifier.fillMaxWidth()) {
-          Text(
-            text = "Feed is Quiet",
-            style = MaterialTheme.typography.titleMedium,
-            color = surfColors.primaryText,
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Center,
-          )
-          Spacer(modifier = Modifier.height(8.dp))
-          Text(
-            text = uiState.policyEmptyDescription,
-            style = MaterialTheme.typography.bodyMedium,
-            color = surfColors.secondaryText,
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Center,
-          )
+        FeedStatusHeader(
+          lastRefreshedAtMillis = uiState.lastRefreshedAtMillis,
+          currentClockMillis = currentClockMillis,
+          isRefreshing = uiState.isRefreshingFeed,
+          failedAccountSyncs = uiState.failedAccountSyncs,
+          totalAccountCount = uiState.accounts.size,
+        )
+        HorizontalDivider(
+          thickness = 1.dp,
+          color = surfColors.cardStroke,
+          modifier = Modifier.padding(horizontal = 18.dp),
+        )
+        Box(
+          modifier = Modifier
+            .fillMaxWidth()
+            .weight(1f)
+            .padding(28.dp),
+          contentAlignment = Alignment.Center,
+        ) {
+          Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+              text = "Feed is Quiet",
+              style = MaterialTheme.typography.titleMedium,
+              color = surfColors.primaryText,
+              textAlign = TextAlign.Center,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+              text = uiState.policyEmptyDescription,
+              style = MaterialTheme.typography.bodyMedium,
+              color = surfColors.secondaryText,
+              textAlign = TextAlign.Center,
+            )
+          }
         }
       }
     } else {
       LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 4.dp, bottom = 80.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(bottom = 84.dp),
       ) {
+        item(key = "feed_status_header") {
+          FeedStatusHeader(
+            lastRefreshedAtMillis = uiState.lastRefreshedAtMillis,
+            currentClockMillis = currentClockMillis,
+            isRefreshing = uiState.isRefreshingFeed,
+            failedAccountSyncs = uiState.failedAccountSyncs,
+            totalAccountCount = uiState.accounts.size,
+          )
+          HorizontalDivider(
+            thickness = 1.dp,
+            color = surfColors.cardStroke,
+            modifier = Modifier.padding(horizontal = 18.dp),
+          )
+        }
         items(uiState.feedItems, key = { it.compositeKey }) { email ->
-          EmailSummaryCard(
+          EmailSummaryRow(
             email = email,
             showAccountBadge = uiState.accounts.size > 1,
             showPinAction = uiState.settings.enablePinToFeed,
             onTogglePin = { onTogglePin(email) },
             onClick = { onEmailClick(email) },
+          )
+          HorizontalDivider(
+            thickness = 1.dp,
+            color = surfColors.cardStroke,
+            modifier = Modifier.padding(horizontal = 18.dp),
           )
         }
       }
@@ -604,7 +642,7 @@ private fun FeedStatusHeader(
   Column(
     modifier = Modifier
       .fillMaxWidth()
-      .padding(horizontal = 16.dp, vertical = 8.dp),
+      .padding(horizontal = 18.dp, vertical = 10.dp),
     verticalArrangement = Arrangement.spacedBy(4.dp),
   ) {
     if (updatedLabel.isNotEmpty()) {
@@ -651,7 +689,11 @@ private fun SearchResultsPane(
     else -> "Last $quickDays days (${results.size})"
   }
 
-  Column(modifier = Modifier.fillMaxSize()) {
+  Column(
+    modifier = Modifier
+      .fillMaxSize()
+      .background(surfColors.cardBg),
+  ) {
     Row(
       modifier = Modifier
         .fillMaxWidth()
@@ -675,8 +717,15 @@ private fun SearchResultsPane(
         color = surfColors.secondaryText,
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.padding(end = 4.dp),
       )
     }
+
+    HorizontalDivider(
+      thickness = 1.dp,
+      color = surfColors.cardStroke,
+      modifier = Modifier.padding(horizontal = 18.dp),
+    )
 
     if (isSearching && results.isEmpty()) {
       Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -686,38 +735,40 @@ private fun SearchResultsPane(
       Box(
         modifier = Modifier
           .fillMaxSize()
-          .padding(24.dp),
+          .padding(28.dp),
         contentAlignment = Alignment.Center,
       ) {
-        SurfCard(modifier = Modifier.fillMaxWidth()) {
-          val emptyMsg = when (quickDays) {
-            1 -> "No emails received today across your connected accounts."
-            2 -> "No emails received yesterday or today across your connected accounts."
-            null -> "No emails matched \"$query\" across your connected accounts."
-            else -> "No emails received in the last $quickDays days across your connected accounts."
-          }
-          Text(
-            text = emptyMsg,
-            style = MaterialTheme.typography.bodyMedium,
-            color = surfColors.secondaryText,
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Center,
-          )
+        val emptyMsg = when (quickDays) {
+          1 -> "No emails received today across your connected accounts."
+          2 -> "No emails received yesterday or today across your connected accounts."
+          null -> "No emails matched \"$query\" across your connected accounts."
+          else -> "No emails received in the last $quickDays days across your connected accounts."
         }
+        Text(
+          text = emptyMsg,
+          style = MaterialTheme.typography.bodyMedium,
+          color = surfColors.secondaryText,
+          modifier = Modifier.fillMaxWidth(),
+          textAlign = TextAlign.Center,
+        )
       }
     } else {
       LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(bottom = 84.dp),
       ) {
         items(results, key = { it.compositeKey }) { email ->
-          EmailSummaryCard(
+          EmailSummaryRow(
             email = email,
             showAccountBadge = true,
             showPinAction = enablePinToFeed,
             onTogglePin = { onTogglePin(email) },
             onClick = { onEmailClick(email) },
+          )
+          HorizontalDivider(
+            thickness = 1.dp,
+            color = surfColors.cardStroke,
+            modifier = Modifier.padding(horizontal = 18.dp),
           )
         }
       }
@@ -725,8 +776,11 @@ private fun SearchResultsPane(
   }
 }
 
+/**
+ * Clean, unboxed feed/search email row separated by a 1dp `<hr>` divider matching the read email view.
+ */
 @Composable
-private fun EmailSummaryCard(
+private fun EmailSummaryRow(
   email: EmailSummary,
   showAccountBadge: Boolean,
   showPinAction: Boolean,
@@ -736,100 +790,91 @@ private fun EmailSummaryCard(
   val surfColors = LocalSurfColors.current
   val weight = if (email.isUnread) FontWeight.Bold else FontWeight.Normal
 
-  Surface(
+  Column(
     modifier = Modifier
       .fillMaxWidth()
-      .clip(RoundedCornerShape(16.dp))
-      .clickable(onClick = onClick),
-    shape = RoundedCornerShape(16.dp),
-    color = surfColors.cardBg,
-    border = BorderStroke(1.dp, surfColors.cardStroke),
+      .clickable(onClick = onClick)
+      .padding(horizontal = 18.dp, vertical = 14.dp),
+    verticalArrangement = Arrangement.spacedBy(5.dp),
   ) {
-    Column(
-      modifier = Modifier
-        .fillMaxWidth()
-        .padding(horizontal = 16.dp, vertical = 14.dp),
-      verticalArrangement = Arrangement.spacedBy(6.dp),
+    Row(
+      modifier = Modifier.fillMaxWidth(),
+      horizontalArrangement = Arrangement.SpaceBetween,
+      verticalAlignment = Alignment.CenterVertically,
     ) {
       Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
+        modifier = Modifier.weight(1f),
         verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
       ) {
-        Row(
-          modifier = Modifier.weight(1f),
-          verticalAlignment = Alignment.CenterVertically,
-          horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-          if (email.isUnread) {
-            Text(
-              text = "\u25CF",
-              color = surfColors.progressBlue,
-              fontSize = 10.sp,
-              fontFamily = FontFamily.Monospace,
-            )
-          }
+        if (email.isUnread) {
           Text(
-            text = email.fromName,
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = weight,
-            color = surfColors.primaryText,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-          )
-          if (showPinAction && email.isFlagged) {
-            Text(
-              text = "Pinned to feed",
-              fontFamily = FontFamily.Monospace,
-              fontSize = 10.sp,
-              fontWeight = FontWeight.Bold,
-              color = surfColors.progressBlue,
-            )
-          }
-        }
-        Spacer(modifier = Modifier.width(8.dp))
-        Row(
-          verticalAlignment = Alignment.CenterVertically,
-          horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-          Text(
-            text = formatTimestamp(email.receivedAtEpochMillis),
+            text = "\u25CF",
+            color = surfColors.progressBlue,
+            fontSize = 10.sp,
             fontFamily = FontFamily.Monospace,
-            fontSize = 11.5.sp,
-            fontWeight = FontWeight.Bold,
-            color = surfColors.mutedText,
           )
-          if (showPinAction) {
-            Icon(
-              imageVector = PushPinIcon,
-              contentDescription = if (email.isFlagged) "Unpin from feed" else "Pin to feed",
-              tint = if (email.isFlagged) surfColors.progressBlue else surfColors.mutedText,
-              modifier = Modifier
-                .size(18.dp)
-                .clickable(onClick = onTogglePin)
-                .padding(1.dp),
-            )
-          }
+        }
+        Text(
+          text = email.fromName,
+          style = MaterialTheme.typography.bodyMedium,
+          fontWeight = weight,
+          color = surfColors.primaryText,
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+        )
+        if (showPinAction && email.isFlagged) {
+          Text(
+            text = "Pinned to feed",
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            color = surfColors.progressBlue,
+          )
         }
       }
-
-      Text(
-        text = email.subject,
-        style = MaterialTheme.typography.bodyLarge,
-        fontWeight = weight,
-        color = surfColors.primaryText,
-        maxLines = 2,
-        overflow = TextOverflow.Ellipsis,
-      )
-
-      if (showAccountBadge) {
+      Spacer(modifier = Modifier.width(8.dp))
+      Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+      ) {
         Text(
-          text = email.accountEmail,
+          text = formatTimestamp(email.receivedAtEpochMillis),
           fontFamily = FontFamily.Monospace,
-          fontSize = 11.sp,
+          fontSize = 11.5.sp,
+          fontWeight = FontWeight.Bold,
           color = surfColors.mutedText,
         )
+        if (showPinAction) {
+          Icon(
+            imageVector = PushPinIcon,
+            contentDescription = if (email.isFlagged) "Unpin from feed" else "Pin to feed",
+            tint = if (email.isFlagged) surfColors.progressBlue else surfColors.mutedText,
+            modifier = Modifier
+              .size(18.dp)
+              .clickable(onClick = onTogglePin)
+              .padding(1.dp),
+          )
+        }
       }
+    }
+
+    Text(
+      text = email.subject,
+      style = MaterialTheme.typography.bodyLarge,
+      fontWeight = weight,
+      color = surfColors.primaryText,
+      maxLines = 2,
+      overflow = TextOverflow.Ellipsis,
+    )
+
+    if (showAccountBadge) {
+      Text(
+        text = email.accountEmail,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp,
+        color = surfColors.mutedText,
+      )
     }
   }
 }
