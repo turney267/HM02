@@ -36,16 +36,26 @@ import javax.mail.search.OrTerm
 import javax.mail.search.ReceivedDateTerm
 import javax.mail.search.SubjectTerm
 
+data class AccountSyncError(
+  val accountEmail: String,
+  val message: String,
+)
+
+data class FeedSyncResult(
+  val items: List<EmailSummary>,
+  val failedAccounts: List<AccountSyncError> = emptyList(),
+)
+
 /**
  * Abstraction for the bare-bones HM02 email operations:
- * 1. Fetch feed across multiple accounts according to [MailPolicyConfig]
+ * 1. Fetch feed across multiple accounts according to [MailPolicyConfig], reporting partial or full errors
  * 2. Server-side search across multiple accounts
  * 3. Read full email message by UID
  * 4. Send email (new, reply, forward)
  */
 interface MailClient {
   suspend fun verifyAccount(account: EmailAccount): Result<Unit>
-  suspend fun fetchFeed(accounts: List<EmailAccount>, config: MailPolicyConfig): Result<List<EmailSummary>>
+  suspend fun fetchFeed(accounts: List<EmailAccount>, config: MailPolicyConfig): FeedSyncResult
   suspend fun searchMessages(
     accounts: List<EmailAccount>,
     query: String,
@@ -75,24 +85,41 @@ class ImapSmtpMailClient : MailClient {
   override suspend fun fetchFeed(
     accounts: List<EmailAccount>,
     config: MailPolicyConfig,
-  ): Result<List<EmailSummary>> = withContext(Dispatchers.IO) {
-    if (accounts.isEmpty()) return@withContext Result.success(emptyList())
+  ): FeedSyncResult = withContext(Dispatchers.IO) {
+    if (accounts.isEmpty()) return@withContext FeedSyncResult(emptyList())
 
-    runCatching {
-      val refreshTimeMillis = System.currentTimeMillis()
-      val perAccountResults = coroutineScope {
-        accounts.map { account ->
-          async {
-            runCatching {
-              fetchAccountFeed(account, config, refreshTimeMillis)
-            }.getOrDefault(emptyList())
+    val refreshTimeMillis = System.currentTimeMillis()
+    val perAccountOutcomes = coroutineScope {
+      accounts.map { account ->
+        async {
+          account.emailAddress to runCatching {
+            fetchAccountFeed(account, config, refreshTimeMillis)
           }
-        }.awaitAll()
-      }
-      perAccountResults
-        .flatten()
-        .sortedByDescending { it.receivedAtEpochMillis }
+        }
+      }.awaitAll()
     }
+
+    val allItems = mutableListOf<EmailSummary>()
+    val failures = mutableListOf<AccountSyncError>()
+
+    for ((emailAddr, outcome) in perAccountOutcomes) {
+      outcome.fold(
+        onSuccess = { items -> allItems.addAll(items) },
+        onFailure = { err ->
+          failures.add(
+            AccountSyncError(
+              accountEmail = emailAddr,
+              message = err.localizedMessage ?: "Connection failed",
+            ),
+          )
+        },
+      )
+    }
+
+    FeedSyncResult(
+      items = allItems.sortedByDescending { it.receivedAtEpochMillis },
+      failedAccounts = failures,
+    )
   }
 
   override suspend fun searchMessages(
@@ -252,8 +279,6 @@ class ImapSmtpMailClient : MailClient {
         val totalCount = folder.messageCount
         if (totalCount <= 0) return emptyList()
 
-        // IMAP SINCE searches at day resolution; we narrow by calendar day on the server
-        // and apply the exact FeedPolicy timestamp & custom filter in Kotlin.
         val cutoffMillis = refreshTimeMillis - policy.lookbackWindow.inWholeMilliseconds
         val sinceCalendar = Calendar.getInstance().apply {
           timeInMillis = cutoffMillis

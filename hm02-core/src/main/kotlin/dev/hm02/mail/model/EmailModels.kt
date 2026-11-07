@@ -61,13 +61,13 @@ enum class MailProviderPreset(
     setupHint = "Go to Settings -> Privacy & Security -> Integrations -> New App Password.",
   ),
   CUSTOM(
-    label = "Custom IMAP / SMTP",
+    label = "Other (Custom IMAP / SMTP)",
     imapHost = "",
     imapPort = 993,
     smtpHost = "",
     smtpPort = 465,
     appPasswordUrl = null,
-    setupHint = "Enter your provider's IMAP and SMTP server details.",
+    setupHint = "Enter your email provider's IMAP and SMTP server details below.",
   ),
 }
 

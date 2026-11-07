@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import dev.hm02.mail.data.AccountStore
+import dev.hm02.mail.data.AccountSyncError
 import dev.hm02.mail.data.ImapSmtpMailClient
 import dev.hm02.mail.data.MailClient
 import dev.hm02.mail.model.ComposeMode
@@ -38,6 +39,7 @@ data class HM02UiState(
   val blockExternalImagesByDefault: Boolean = false,
   val accounts: List<EmailAccount> = emptyList(),
   val feedItems: List<EmailSummary> = emptyList(),
+  val failedAccountSyncs: List<AccountSyncError> = emptyList(),
   val searchResults: List<EmailSummary> = emptyList(),
   val searchQuery: String = "",
   val isRefreshingFeed: Boolean = false,
@@ -79,7 +81,7 @@ class HM02ViewModel(
 
   /**
    * Called automatically every time the user opens/resumes the app (ON_START)
-   * or taps the manual refresh button.
+   * or taps the manual refresh icon.
    */
   fun refreshFeed() {
     val accounts = accountStore.accounts.value
@@ -87,6 +89,7 @@ class HM02ViewModel(
       _uiState.update {
         it.copy(
           feedItems = emptyList(),
+          failedAccountSyncs = emptyList(),
           isRefreshingFeed = false,
           lastRefreshedAtMillis = System.currentTimeMillis(),
         )
@@ -96,26 +99,25 @@ class HM02ViewModel(
 
     viewModelScope.launch {
       _uiState.update { it.copy(isRefreshingFeed = true, statusMessage = null) }
-      val result = mailClient.fetchFeed(accounts, policyConfig)
-      result.fold(
-        onSuccess = { items ->
-          _uiState.update {
-            it.copy(
-              feedItems = items,
-              isRefreshingFeed = false,
-              lastRefreshedAtMillis = System.currentTimeMillis(),
-            )
-          }
-        },
-        onFailure = { error ->
-          _uiState.update {
-            it.copy(
-              isRefreshingFeed = false,
-              statusMessage = "Feed refresh failed: ${error.localizedMessage ?: "Connection error"}",
-            )
-          }
-        },
-      )
+      val syncResult = mailClient.fetchFeed(accounts, policyConfig)
+      val failures = syncResult.failedAccounts
+      val errorNotice = when {
+        failures.isEmpty() -> null
+        failures.size == accounts.size ->
+          "Sync failed for all accounts (${failures.first().accountEmail}: ${failures.first().message})"
+        else ->
+          "Partial sync error (${failures.joinToString { it.accountEmail }})"
+      }
+
+      _uiState.update {
+        it.copy(
+          feedItems = syncResult.items,
+          failedAccountSyncs = failures,
+          isRefreshingFeed = false,
+          lastRefreshedAtMillis = System.currentTimeMillis(),
+          statusMessage = errorNotice,
+        )
+      }
     }
   }
 
@@ -275,6 +277,7 @@ class HM02ViewModel(
       .ifBlank { null }
 
     val quotedText = buildQuotedBody(detail, prefixLines = true)
+    // Two full blank lines of clean breathing room above the quoted email
     _uiState.update {
       it.copy(
         activePane = ActivePane.Composer(
@@ -282,7 +285,7 @@ class HM02ViewModel(
             fromAccount = account,
             to = detail.replyToAddress ?: detail.summary.fromAddress,
             subject = replySubject,
-            body = "\n\n$quotedText",
+            body = "\n\n\n$quotedText",
             mode = ComposeMode.REPLY,
             inReplyToMessageId = originalMessageId,
             referencesHeader = combinedReferences,
@@ -304,6 +307,7 @@ class HM02ViewModel(
       "Fwd: $cleanSubject"
     }
     val forwardedBody = buildQuotedBody(detail, prefixLines = false)
+    // Two full blank lines of clean breathing room above the forwarded email
     _uiState.update {
       it.copy(
         activePane = ActivePane.Composer(
@@ -311,7 +315,7 @@ class HM02ViewModel(
             fromAccount = account,
             to = "",
             subject = forwardSubject,
-            body = "\n\n$forwardedBody",
+            body = "\n\n\n$forwardedBody",
             mode = ComposeMode.FORWARD,
             referencesHeader = detail.summary.messageIdHeader,
           ),
