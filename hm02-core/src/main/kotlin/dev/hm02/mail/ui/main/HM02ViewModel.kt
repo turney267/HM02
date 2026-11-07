@@ -11,8 +11,8 @@ import dev.hm02.mail.model.EmailAccount
 import dev.hm02.mail.model.EmailDetail
 import dev.hm02.mail.model.EmailSummary
 import dev.hm02.mail.model.OutgoingEmailDraft
-import dev.hm02.mail.policy.DefaultFeedPolicy
-import dev.hm02.mail.policy.FeedPolicy
+import dev.hm02.mail.policy.MailPolicyConfig
+import dev.hm02.mail.policy.MailPolicyProvider
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -31,8 +31,11 @@ sealed interface ActivePane {
 }
 
 data class HM02UiState(
-  val policyName: String = DefaultFeedPolicy.name,
-  val policyEmptyDescription: String = DefaultFeedPolicy.emptyStateDescription,
+  val brandTitle: String = "HM02",
+  val policyName: String = "Recent (24h)",
+  val policyEmptyDescription: String = "",
+  val blockRemoteMediaInEmails: Boolean = true,
+  val blockExternalImagesByDefault: Boolean = false,
   val accounts: List<EmailAccount> = emptyList(),
   val feedItems: List<EmailSummary> = emptyList(),
   val searchResults: List<EmailSummary> = emptyList(),
@@ -49,13 +52,16 @@ data class HM02UiState(
 class HM02ViewModel(
   private val accountStore: AccountStore,
   private val mailClient: MailClient = ImapSmtpMailClient(),
-  private val feedPolicy: FeedPolicy = DefaultFeedPolicy,
+  private val policyConfig: MailPolicyConfig = MailPolicyProvider.getConfig(),
 ) : ViewModel() {
 
   private val _uiState = MutableStateFlow(
     HM02UiState(
-      policyName = feedPolicy.name,
-      policyEmptyDescription = feedPolicy.emptyStateDescription,
+      brandTitle = policyConfig.brandTitle,
+      policyName = policyConfig.feedPolicy.name,
+      policyEmptyDescription = policyConfig.feedPolicy.emptyStateDescription,
+      blockRemoteMediaInEmails = policyConfig.blockRemoteMediaInEmails,
+      blockExternalImagesByDefault = policyConfig.blockExternalImagesByDefault,
       accounts = accountStore.accounts.value,
     ),
   )
@@ -90,7 +96,7 @@ class HM02ViewModel(
 
     viewModelScope.launch {
       _uiState.update { it.copy(isRefreshingFeed = true, statusMessage = null) }
-      val result = mailClient.fetchFeed(accounts, feedPolicy)
+      val result = mailClient.fetchFeed(accounts, policyConfig)
       result.fold(
         onSuccess = { items ->
           _uiState.update {
@@ -401,14 +407,14 @@ class HM02ViewModel(
   companion object {
     fun provideFactory(
       accountStore: AccountStore,
-      feedPolicy: FeedPolicy = DefaultFeedPolicy,
+      policyConfig: MailPolicyConfig = MailPolicyProvider.getConfig(),
     ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
       @Suppress("UNCHECKED_CAST")
       override fun <T : ViewModel> create(modelClass: Class<T>): T {
         return HM02ViewModel(
           accountStore = accountStore,
           mailClient = ImapSmtpMailClient(),
-          feedPolicy = feedPolicy,
+          policyConfig = policyConfig,
         ) as T
       }
     }

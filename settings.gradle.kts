@@ -32,4 +32,5 @@ plugins {
 
 rootProject.name = "HM02"
 
+include(":hm02-core")
 include(":app")

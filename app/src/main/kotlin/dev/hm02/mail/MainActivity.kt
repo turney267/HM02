@@ -1,48 +1,19 @@
 package dev.hm02.mail
 
-import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.ui.Modifier
-import androidx.lifecycle.viewmodel.compose.viewModel
-import dev.hm02.mail.data.AccountStore
 import dev.hm02.mail.policy.DefaultFeedPolicy
-import dev.hm02.mail.ui.main.HM02AppScreen
-import dev.hm02.mail.ui.main.HM02ViewModel
-import dev.hm02.mail.ui.theme.HM02Theme
+import dev.hm02.mail.policy.MailPolicyConfig
 
-class MainActivity : ComponentActivity() {
-  override fun onCreate(savedInstanceState: Bundle?) {
-    super.onCreate(savedInstanceState)
-
-    val accountStore = AccountStore(applicationContext)
-
-    // Open-source template uses DefaultFeedPolicy (24h feed window).
-    // Derivative apps (e.g., "Fly") can replace this with:
-    //   TimeWindowFeedPolicy(window = 10.minutes)
-    // or a custom FeedPolicy implementation with sender/keyword restrictions.
-    val activeFeedPolicy = DefaultFeedPolicy
-
-    enableEdgeToEdge()
-    setContent {
-      HM02Theme {
-        Surface(
-          modifier = Modifier.fillMaxSize(),
-          color = MaterialTheme.colorScheme.background,
-        ) {
-          val hm02ViewModel: HM02ViewModel = viewModel(
-            factory = HM02ViewModel.provideFactory(
-              accountStore = accountStore,
-              feedPolicy = activeFeedPolicy,
-            ),
-          )
-          HM02AppScreen(viewModel = hm02ViewModel)
-        }
-      }
-    }
-  }
+/**
+ * Standalone open-source HM02 template Activity (`:app`), powered by `:hm02-core`.
+ *
+ * Uses the unopinionated 24-hour [DefaultFeedPolicy] out of the box.
+ * Host apps (such as "Fly") can depend on `:hm02-core` and configure [MailPolicyConfig]
+ * with a 10-minute feed window and custom sender/subject rules.
+ */
+class MainActivity : HM02MailActivity() {
+  override fun resolvePolicyConfig(): MailPolicyConfig =
+    MailPolicyConfig(
+      brandTitle = "HM02",
+      feedPolicy = DefaultFeedPolicy,
+    )
 }

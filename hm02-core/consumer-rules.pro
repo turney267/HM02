@@ -1,0 +1,6 @@
+-keep class javax.mail.** { *; }
+-keep class com.sun.mail.** { *; }
+-keep class javax.activation.** { *; }
+-keep class dev.hm02.mail.model.** { *; }
+-dontwarn java.awt.**
+-dontwarn javax.security.sasl.**

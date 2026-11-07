@@ -4,7 +4,7 @@ import dev.hm02.mail.model.EmailAccount
 import dev.hm02.mail.model.EmailDetail
 import dev.hm02.mail.model.EmailSummary
 import dev.hm02.mail.model.OutgoingEmailDraft
-import dev.hm02.mail.policy.FeedPolicy
+import dev.hm02.mail.policy.MailPolicyConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -38,14 +38,14 @@ import javax.mail.search.SubjectTerm
 
 /**
  * Abstraction for the bare-bones HM02 email operations:
- * 1. Fetch feed across multiple accounts according to [FeedPolicy]
+ * 1. Fetch feed across multiple accounts according to [MailPolicyConfig]
  * 2. Server-side search across multiple accounts
  * 3. Read full email message by UID
  * 4. Send email (new, reply, forward)
  */
 interface MailClient {
   suspend fun verifyAccount(account: EmailAccount): Result<Unit>
-  suspend fun fetchFeed(accounts: List<EmailAccount>, policy: FeedPolicy): Result<List<EmailSummary>>
+  suspend fun fetchFeed(accounts: List<EmailAccount>, config: MailPolicyConfig): Result<List<EmailSummary>>
   suspend fun searchMessages(
     accounts: List<EmailAccount>,
     query: String,
@@ -74,7 +74,7 @@ class ImapSmtpMailClient : MailClient {
 
   override suspend fun fetchFeed(
     accounts: List<EmailAccount>,
-    policy: FeedPolicy,
+    config: MailPolicyConfig,
   ): Result<List<EmailSummary>> = withContext(Dispatchers.IO) {
     if (accounts.isEmpty()) return@withContext Result.success(emptyList())
 
@@ -84,7 +84,7 @@ class ImapSmtpMailClient : MailClient {
         accounts.map { account ->
           async {
             runCatching {
-              fetchAccountFeed(account, policy, refreshTimeMillis)
+              fetchAccountFeed(account, config, refreshTimeMillis)
             }.getOrDefault(emptyList())
           }
         }.awaitAll()
@@ -240,9 +240,10 @@ class ImapSmtpMailClient : MailClient {
 
   private fun fetchAccountFeed(
     account: EmailAccount,
-    policy: FeedPolicy,
+    config: MailPolicyConfig,
     refreshTimeMillis: Long,
   ): List<EmailSummary> {
+    val policy = config.feedPolicy
     openImapStore(account).use { store ->
       val folder = store.getFolder(INBOX_FOLDER)
       val uidFolder = folder as? UIDFolder ?: return emptyList()
@@ -273,7 +274,7 @@ class ImapSmtpMailClient : MailClient {
               msg.toEmailSummary(account, uid)
             }.getOrNull()
           }
-          .filter { summary -> policy.shouldIncludeInFeed(summary, refreshTimeMillis) }
+          .filter { summary -> config.evaluateFeedInclusion(summary, refreshTimeMillis) }
           .sortedByDescending { it.receivedAtEpochMillis }
       } finally {
         runCatching { folder.close(false) }
