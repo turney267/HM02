@@ -63,12 +63,13 @@ class FeedPolicyTest {
   }
 
   @Test
-  fun `parseQuickDaySearchDays parses a, a2, a7 and ignores normal keywords`() {
+  fun `parseQuickDaySearchDays parses only a and a2 and does not allow beyond a2`() {
     assertEquals(1, parseQuickDaySearchDays("a"))
     assertEquals(1, parseQuickDaySearchDays("A"))
     assertEquals(1, parseQuickDaySearchDays(" a1 "))
     assertEquals(2, parseQuickDaySearchDays("a2"))
-    assertEquals(7, parseQuickDaySearchDays("a7"))
+    assertNull(parseQuickDaySearchDays("a3"))
+    assertNull(parseQuickDaySearchDays("a7"))
     assertNull(parseQuickDaySearchDays("amazon"))
     assertNull(parseQuickDaySearchDays("a0"))
     assertNull(parseQuickDaySearchDays("invoice"))

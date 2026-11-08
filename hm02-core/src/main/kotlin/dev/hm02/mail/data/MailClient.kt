@@ -50,16 +50,13 @@ data class FeedSyncResult(
  * Parses quick day-range search shortcuts:
  * - `"a"` or `"a1"` -> `1` (all emails from today)
  * - `"a2"` -> `2` (all emails from yesterday and today)
- * - `"a<N>"` -> `N` (all emails from the last N calendar days including today)
- * Returns `null` if [query] is a normal keyword search.
+ * Returns `null` for any other query (does not allow going beyond `"a2"`).
  */
 fun parseQuickDaySearchDays(query: String): Int? {
-  val match = QUICK_DAY_SEARCH_REGEX.matchEntire(query.trim()) ?: return null
-  val digits = match.groupValues[1]
-  return if (digits.isEmpty()) {
-    1
-  } else {
-    digits.toIntOrNull()?.takeIf { it in 1..365 }
+  return when (query.trim().lowercase()) {
+    "a", "a1" -> 1
+    "a2" -> 2
+    else -> null
   }
 }
 

@@ -97,17 +97,33 @@ class SettingsAndContactsStore(context: Context) {
   }
 
   /**
-   * Harvests sender and recipient contacts from an opened email when [UserSettings.accessDeviceContacts] is enabled.
+   * Harvests sender names and addresses from feed or search summaries when [UserSettings.rememberSenders] is enabled.
+   */
+  fun harvestSendersFromSummaries(summaries: List<EmailSummary>) {
+    if (!_settings.value.rememberSenders || summaries.isEmpty()) return
+    val candidates = summaries.mapNotNull { summary ->
+      if (!summary.fromAddress.contains("@")) return@mapNotNull null
+      ContactSuggestion(
+        name = summary.fromName.takeIf { !it.equals(summary.fromAddress, ignoreCase = true) }.orEmpty(),
+        emailAddress = summary.fromAddress.trim(),
+        source = "Sender",
+      )
+    }
+    addSavedContacts(candidates)
+  }
+
+  /**
+   * Harvests sender and recipient contacts from an opened email when [UserSettings.rememberSenders] is enabled.
    */
   fun harvestContactsFromEmail(detail: EmailDetail) {
-    if (!_settings.value.accessDeviceContacts) return
+    if (!_settings.value.rememberSenders) return
     val candidates = mutableListOf<ContactSuggestion>()
     if (detail.summary.fromAddress.contains("@")) {
       candidates.add(
         ContactSuggestion(
           name = detail.summary.fromName.takeIf { !it.equals(detail.summary.fromAddress, ignoreCase = true) }.orEmpty(),
           emailAddress = detail.summary.fromAddress.trim(),
-          source = "Email",
+          source = "Sender",
         ),
       )
     }
@@ -118,10 +134,10 @@ class SettingsAndContactsStore(context: Context) {
   }
 
   /**
-   * Harvests recipient addresses from a sent email when [UserSettings.accessDeviceContacts] is enabled.
+   * Harvests recipient addresses from a sent email when [UserSettings.rememberSenders] is enabled.
    */
   fun harvestContactsFromRawAddresses(rawList: String) {
-    if (!_settings.value.accessDeviceContacts) return
+    if (!_settings.value.rememberSenders) return
     val candidates = rawList
       .split(",")
       .mapNotNull { parseContactFromFormattedAddress(it) }
@@ -154,8 +170,29 @@ class SettingsAndContactsStore(context: Context) {
   }
 
   /**
-   * Queries matching contact suggestions from both saved email contacts and Android device contacts
-   * when [UserSettings.accessDeviceContacts] is enabled.
+   * Queries matching remembered senders for the search bar autosuggest dropdown
+   * when [UserSettings.rememberSenders] is enabled.
+   */
+  fun querySenderSearchSuggestions(
+    rawQuery: String,
+    limit: Int = 5,
+  ): List<ContactSuggestion> {
+    if (!_settings.value.rememberSenders) return emptyList()
+    val token = rawQuery.trim().lowercase(Locale.US)
+    if (token.isEmpty() || parseQuickDaySearchDays(token) != null) return emptyList()
+
+    return _savedContacts.value
+      .filter { contact ->
+        contact.name.lowercase(Locale.US).contains(token) ||
+          contact.emailAddress.lowercase(Locale.US).contains(token)
+      }
+      .take(limit)
+  }
+
+  /**
+   * Queries matching contact suggestions for prefill in the `To` / `Cc` fields of emails:
+   * - Includes remembered senders when [UserSettings.rememberSenders] is enabled
+   * - Includes Android device contacts when [UserSettings.accessDeviceContacts] is enabled
    */
   suspend fun queryContactSuggestions(
     rawInput: String,
@@ -165,20 +202,24 @@ class SettingsAndContactsStore(context: Context) {
     if (activeToken.isEmpty()) return@withContext emptyList()
 
     val currentSettings = _settings.value
-    if (!currentSettings.accessDeviceContacts) return@withContext emptyList()
+    if (!currentSettings.rememberSenders && !currentSettings.accessDeviceContacts) {
+      return@withContext emptyList()
+    }
 
     val results = LinkedHashMap<String, ContactSuggestion>()
 
-    for (contact in _savedContacts.value) {
-      if (contact.name.lowercase(Locale.US).contains(activeToken) ||
-        contact.emailAddress.lowercase(Locale.US).contains(activeToken)
-      ) {
-        results[contact.emailAddress.lowercase(Locale.US)] = contact
-        if (results.size >= limit) break
+    if (currentSettings.rememberSenders) {
+      for (contact in _savedContacts.value) {
+        if (contact.name.lowercase(Locale.US).contains(activeToken) ||
+          contact.emailAddress.lowercase(Locale.US).contains(activeToken)
+        ) {
+          results[contact.emailAddress.lowercase(Locale.US)] = contact
+          if (results.size >= limit) break
+        }
       }
     }
 
-    if (hasContactsPermission() && results.size < limit) {
+    if (currentSettings.accessDeviceContacts && hasContactsPermission() && results.size < limit) {
       runCatching {
         val projection = arrayOf(
           ContactsContract.CommonDataKinds.Email.DISPLAY_NAME_PRIMARY,

@@ -211,6 +211,7 @@ fun HM02AppScreen(
         HM02TopBar(
           uiState = uiState,
           onSearchQueryChange = viewModel::updateSearchQuery,
+          onSelectSearchSuggestion = viewModel::selectSearchSuggestion,
           onSearchSubmit = viewModel::executeSearch,
           onClearSearch = viewModel::clearSearchAndReturnToFeed,
           onRefreshClick = viewModel::refreshFeed,
@@ -304,6 +305,7 @@ fun HM02AppScreen(
           SettingsPane(
             uiState = uiState,
             onToggleAccessContacts = viewModel::updateAccessDeviceContacts,
+            onToggleRememberSenders = viewModel::updateRememberSenders,
             onTogglePinToFeed = viewModel::updateEnablePinToFeed,
             onContactsPermissionResult = { granted ->
               viewModel.refreshContactsPermissionState()
@@ -323,6 +325,7 @@ fun HM02AppScreen(
 private fun HM02TopBar(
   uiState: HM02UiState,
   onSearchQueryChange: (String) -> Unit,
+  onSelectSearchSuggestion: (ContactSuggestion) -> Unit,
   onSearchSubmit: () -> Unit,
   onClearSearch: () -> Unit,
   onRefreshClick: () -> Unit,
@@ -466,6 +469,50 @@ private fun HM02TopBar(
           }
         },
       )
+    }
+
+    // Autosuggest dropdown of remembered senders when typing in the search bar
+    if (uiState.searchSuggestions.isNotEmpty()) {
+      HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+      Column(
+        modifier = Modifier
+          .fillMaxWidth()
+          .background(surfColors.cardBg)
+          .padding(horizontal = 18.dp),
+      ) {
+        uiState.searchSuggestions.forEachIndexed { index, suggestion ->
+          Row(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clickable {
+                focusManager.clearFocus()
+                onSelectSearchSuggestion(suggestion)
+              }
+              .padding(vertical = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Text(
+              text = suggestion.formatted,
+              style = MaterialTheme.typography.bodySmall,
+              color = surfColors.progressBlue,
+              fontWeight = FontWeight.SemiBold,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
+              modifier = Modifier.weight(1f),
+            )
+            Text(
+              text = "SENDER",
+              fontFamily = FontFamily.Monospace,
+              fontSize = 10.sp,
+              color = surfColors.mutedText,
+            )
+          }
+          if (index < uiState.searchSuggestions.lastIndex) {
+            HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+          }
+        }
+      }
     }
 
     if (isBusy) {
@@ -823,15 +870,6 @@ private fun EmailSummaryRow(
           maxLines = 1,
           overflow = TextOverflow.Ellipsis,
         )
-        if (showPinAction && email.isFlagged) {
-          Text(
-            text = "Pinned to feed",
-            fontFamily = FontFamily.Monospace,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold,
-            color = surfColors.progressBlue,
-          )
-        }
       }
       Spacer(modifier = Modifier.width(8.dp))
       Row(
@@ -1003,26 +1041,12 @@ private fun EmailReaderPane(
             color = surfColors.secondaryText,
           )
         }
-        Row(
-          verticalAlignment = Alignment.CenterVertically,
-          horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-          Text(
-            text = formatFullTimestamp(summary.receivedAtEpochMillis),
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.5.sp,
-            color = surfColors.mutedText,
-          )
-          if (enablePinToFeed && summary.isFlagged) {
-            Text(
-              text = "Pinned to feed",
-              fontFamily = FontFamily.Monospace,
-              fontSize = 11.5.sp,
-              fontWeight = FontWeight.Bold,
-              color = surfColors.progressBlue,
-            )
-          }
-        }
+        Text(
+          text = formatFullTimestamp(summary.receivedAtEpochMillis),
+          fontFamily = FontFamily.Monospace,
+          fontSize = 11.5.sp,
+          color = surfColors.mutedText,
+        )
       }
 
       HorizontalDivider(
@@ -1451,14 +1475,16 @@ private fun ComposeEmailPane(
 
 /**
  * Full-screen Settings page with "blank page" vibes matching [EmailReaderPane],
- * containing only the two toggle options without helper text:
+ * containing the three toggle options without helper text:
  * 1. Access Device Contacts
- * 2. Enable Pin to Feed
+ * 2. Remember Senders
+ * 3. Enable Pin to Feed
  */
 @Composable
 private fun SettingsPane(
   uiState: HM02UiState,
   onToggleAccessContacts: (Boolean) -> Unit,
+  onToggleRememberSenders: (Boolean) -> Unit,
   onTogglePinToFeed: (Boolean) -> Unit,
   onContactsPermissionResult: (Boolean) -> Unit,
   onBack: () -> Unit,
@@ -1532,6 +1558,30 @@ private fun SettingsPane(
               onToggleAccessContacts(enabled)
             }
           },
+          colors = SwitchDefaults.colors(
+            checkedThumbColor = surfColors.activePillText,
+            checkedTrackColor = surfColors.activePillBg,
+          ),
+        )
+      }
+
+      HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(vertical = 16.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Text(
+          text = "Remember Senders",
+          style = MaterialTheme.typography.bodyLarge,
+          color = surfColors.primaryText,
+        )
+        Switch(
+          checked = settings.rememberSenders,
+          onCheckedChange = onToggleRememberSenders,
           colors = SwitchDefaults.colors(
             checkedThumbColor = surfColors.activePillText,
             checkedTrackColor = surfColors.activePillBg,

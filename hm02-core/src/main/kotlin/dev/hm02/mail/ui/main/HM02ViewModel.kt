@@ -46,6 +46,7 @@ data class HM02UiState(
   val savedContactsCount: Int = 0,
   val flaggedEmailsCount: Int = 0,
   val contactSuggestions: List<ContactSuggestion> = emptyList(),
+  val searchSuggestions: List<ContactSuggestion> = emptyList(),
   val accounts: List<EmailAccount> = emptyList(),
   val feedItems: List<EmailSummary> = emptyList(),
   val failedAccountSyncs: List<AccountSyncError> = emptyList(),
@@ -154,6 +155,7 @@ class HM02ViewModel(
       _uiState.update { it.copy(isRefreshingFeed = true, statusMessage = null) }
       val syncResult = mailClient.fetchFeed(accounts, policyConfig)
       latestSyncedFeedItems = syncResult.items
+      settingsAndContactsStore.harvestSendersFromSummaries(syncResult.items)
       val failures = syncResult.failedAccounts
       val errorNotice = when {
         failures.isEmpty() -> null
@@ -180,7 +182,23 @@ class HM02ViewModel(
   }
 
   fun updateSearchQuery(query: String) {
-    _uiState.update { it.copy(searchQuery = query) }
+    val suggestions = settingsAndContactsStore.querySenderSearchSuggestions(query)
+    _uiState.update {
+      it.copy(
+        searchQuery = query,
+        searchSuggestions = suggestions,
+      )
+    }
+  }
+
+  fun selectSearchSuggestion(suggestion: ContactSuggestion) {
+    _uiState.update {
+      it.copy(
+        searchQuery = suggestion.emailAddress,
+        searchSuggestions = emptyList(),
+      )
+    }
+    executeSearch()
   }
 
   fun executeSearch() {
@@ -199,6 +217,7 @@ class HM02ViewModel(
       _uiState.update {
         it.copy(
           isSearching = true,
+          searchSuggestions = emptyList(),
           activePane = ActivePane.SearchResults(query),
           statusMessage = null,
         )
@@ -206,6 +225,7 @@ class HM02ViewModel(
       val result = mailClient.searchMessages(accounts, query)
       result.fold(
         onSuccess = { items ->
+          settingsAndContactsStore.harvestSendersFromSummaries(items)
           val flaggedKeys = settingsAndContactsStore.flaggedEmails.value
             .map { it.compositeKey }
             .toSet()
@@ -235,6 +255,7 @@ class HM02ViewModel(
     _uiState.update {
       it.copy(
         searchQuery = "",
+        searchSuggestions = emptyList(),
         searchResults = emptyList(),
         activePane = ActivePane.Feed,
       )
@@ -246,6 +267,7 @@ class HM02ViewModel(
       it.copy(
         activePane = ActivePane.Feed,
         contactSuggestions = emptyList(),
+        searchSuggestions = emptyList(),
       )
     }
   }
@@ -267,6 +289,15 @@ class HM02ViewModel(
   fun updateAccessDeviceContacts(enabled: Boolean) {
     settingsAndContactsStore.updateSettings { it.copy(accessDeviceContacts = enabled) }
     refreshContactsPermissionState()
+  }
+
+  fun updateRememberSenders(enabled: Boolean) {
+    settingsAndContactsStore.updateSettings { it.copy(rememberSenders = enabled) }
+    if (enabled) {
+      settingsAndContactsStore.harvestSendersFromSummaries(latestSyncedFeedItems + _uiState.value.searchResults)
+    } else {
+      _uiState.update { it.copy(searchSuggestions = emptyList()) }
+    }
   }
 
   fun updateEnablePinToFeed(enabled: Boolean) {
