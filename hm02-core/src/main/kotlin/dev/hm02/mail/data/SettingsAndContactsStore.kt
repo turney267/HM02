@@ -5,11 +5,15 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.provider.ContactsContract
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
 import androidx.core.content.ContextCompat
 import dev.hm02.mail.model.ContactSuggestion
 import dev.hm02.mail.model.EmailDetail
 import dev.hm02.mail.model.EmailSummary
 import dev.hm02.mail.model.UserSettings
+import dev.hm02.mail.model.sanitizeHeaderControlChars
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,7 +21,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.security.KeyStore
 import java.util.Locale
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 /**
  * Manages user-configurable settings ([UserSettings]), locally persisted flagged emails
@@ -144,6 +153,7 @@ class SettingsAndContactsStore(context: Context) {
     addSavedContacts(candidates)
   }
 
+  @Synchronized
   fun addSavedContacts(newContacts: List<ContactSuggestion>) {
     if (newContacts.isEmpty()) return
     val byEmail = _savedContacts.value
@@ -151,21 +161,23 @@ class SettingsAndContactsStore(context: Context) {
       .toMutableMap()
 
     for (contact in newContacts) {
-      val key = contact.emailAddress.trim().lowercase(Locale.US)
+      val cleanEmail = sanitizeHeaderControlChars(contact.emailAddress).replace(" ", "")
+      val cleanName = sanitizeHeaderControlChars(contact.name)
+      val key = cleanEmail.lowercase(Locale.US)
       if (key.isBlank() || !key.contains("@")) continue
       val existing = byEmail[key]
-      if (existing == null || (existing.name.isBlank() && contact.name.isNotBlank())) {
+      if (existing == null || (existing.name.isBlank() && cleanName.isNotBlank())) {
         byEmail[key] = contact.copy(
-          name = contact.name.trim(),
-          emailAddress = contact.emailAddress.trim(),
+          name = cleanName,
+          emailAddress = cleanEmail,
         )
       }
     }
 
-    val merged = byEmail.values.sortedBy {
-      it.name.ifBlank { it.emailAddress }.lowercase(Locale.US)
-    }
-    prefs.edit().putString(KEY_SAVED_CONTACTS, json.encodeToString(merged)).apply()
+    val merged = byEmail.values
+      .sortedBy { it.name.ifBlank { it.emailAddress }.lowercase(Locale.US) }
+      .take(MAX_SAVED_CONTACTS)
+    writeEncryptedJson(KEY_SAVED_CONTACTS, json.encodeToString(merged))
     _savedContacts.value = merged
   }
 
@@ -176,10 +188,11 @@ class SettingsAndContactsStore(context: Context) {
   fun querySenderSearchSuggestions(
     rawQuery: String,
     limit: Int = 5,
+    maxSearchDays: Int = 2,
   ): List<ContactSuggestion> {
     if (!_settings.value.rememberSenders) return emptyList()
     val token = rawQuery.trim().lowercase(Locale.US)
-    if (token.isEmpty() || parseQuickDaySearchDays(token) != null) return emptyList()
+    if (token.isEmpty() || parseQuickDaySearchDays(token, maxDays = maxSearchDays) != null) return emptyList()
 
     return _savedContacts.value
       .filter { contact ->
@@ -207,17 +220,6 @@ class SettingsAndContactsStore(context: Context) {
     }
 
     val results = LinkedHashMap<String, ContactSuggestion>()
-
-    if (currentSettings.rememberSenders) {
-      for (contact in _savedContacts.value) {
-        if (contact.name.lowercase(Locale.US).contains(activeToken) ||
-          contact.emailAddress.lowercase(Locale.US).contains(activeToken)
-        ) {
-          results[contact.emailAddress.lowercase(Locale.US)] = contact
-          if (results.size >= limit) break
-        }
-      }
-    }
 
     if (currentSettings.accessDeviceContacts && hasContactsPermission() && results.size < limit) {
       runCatching {
@@ -256,15 +258,35 @@ class SettingsAndContactsStore(context: Context) {
       }
     }
 
+    if (currentSettings.rememberSenders && results.size < limit) {
+      for (contact in _savedContacts.value) {
+        if (contact.name.lowercase(Locale.US).contains(activeToken) ||
+          contact.emailAddress.lowercase(Locale.US).contains(activeToken)
+        ) {
+          val key = contact.emailAddress.lowercase(Locale.US)
+          if (!results.containsKey(key)) {
+            results[key] = contact
+            if (results.size >= limit) break
+          }
+        }
+      }
+    }
+
     results.values.toList()
   }
 
   private fun parseContactFromFormattedAddress(raw: String): ContactSuggestion? {
-    val trimmed = raw.trim()
+    val trimmed = sanitizeHeaderControlChars(raw)
     if (trimmed.isEmpty() || !trimmed.contains("@")) return null
     return if (trimmed.contains("<") && trimmed.endsWith(">")) {
-      val namePart = trimmed.substringBefore("<").trim().trim('"')
-      val emailPart = trimmed.substringAfter("<").substringBeforeLast(">").trim()
+      val namePart = trimmed
+        .substringBeforeLast("<")
+        .trim()
+        .removeSurrounding("\"")
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+        .trim()
+      val emailPart = trimmed.substringAfterLast("<").substringBeforeLast(">").trim()
       if (emailPart.contains("@")) {
         ContactSuggestion(name = namePart, emailAddress = emailPart, source = "Email")
       } else {
@@ -275,9 +297,10 @@ class SettingsAndContactsStore(context: Context) {
     }
   }
 
+  @Synchronized
   private fun saveFlaggedEmails(items: List<EmailSummary>) {
     val sorted = items.sortedByDescending { it.receivedAtEpochMillis }
-    prefs.edit().putString(KEY_FLAGGED_EMAILS, json.encodeToString(sorted)).apply()
+    writeEncryptedJson(KEY_FLAGGED_EMAILS, json.encodeToString(sorted))
     _flaggedEmails.value = sorted
   }
 
@@ -287,16 +310,89 @@ class SettingsAndContactsStore(context: Context) {
   }
 
   private fun loadFlaggedEmails(): List<EmailSummary> {
-    val raw = prefs.getString(KEY_FLAGGED_EMAILS, null) ?: return emptyList()
-    return runCatching { json.decodeFromString<List<EmailSummary>>(raw) }.getOrDefault(emptyList())
+    val rawJson = readEncryptedOrLegacyJson(KEY_FLAGGED_EMAILS) ?: return emptyList()
+    return runCatching { json.decodeFromString<List<EmailSummary>>(rawJson) }.getOrDefault(emptyList())
   }
 
   private fun loadSavedContacts(): List<ContactSuggestion> {
-    val raw = prefs.getString(KEY_SAVED_CONTACTS, null) ?: return emptyList()
-    return runCatching { json.decodeFromString<List<ContactSuggestion>>(raw) }.getOrDefault(emptyList())
+    val rawJson = readEncryptedOrLegacyJson(KEY_SAVED_CONTACTS) ?: return emptyList()
+    return runCatching { json.decodeFromString<List<ContactSuggestion>>(rawJson) }.getOrDefault(emptyList())
+  }
+
+  private fun writeEncryptedJson(prefKey: String, plaintextJson: String) {
+    runCatching {
+      val plaintextBytes = plaintextJson.encodeToByteArray()
+      try {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSecretKey())
+        cipher.updateAAD(prefKey.encodeToByteArray())
+        val ciphertextBytes = cipher.doFinal(plaintextBytes)
+        val ivB64 = Base64.encodeToString(cipher.iv, Base64.NO_WRAP)
+        val ctB64 = Base64.encodeToString(ciphertextBytes, Base64.NO_WRAP)
+        prefs.edit().putString(prefKey, "$ENCRYPTED_PREFIX$ivB64:$ctB64").apply()
+      } finally {
+        plaintextBytes.fill(0)
+      }
+    }
+  }
+
+  private fun readEncryptedOrLegacyJson(prefKey: String): String? {
+    val stored = prefs.getString(prefKey, null) ?: return null
+    if (stored.startsWith(ENCRYPTED_PREFIX)) {
+      val payload = stored.removePrefix(ENCRYPTED_PREFIX)
+      val separatorIndex = payload.indexOf(':')
+      if (separatorIndex <= 0 || separatorIndex >= payload.lastIndex) return null
+      val ivB64 = payload.substring(0, separatorIndex)
+      val ctB64 = payload.substring(separatorIndex + 1)
+      return runCatching {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        val iv = Base64.decode(ivB64, Base64.NO_WRAP)
+        cipher.init(Cipher.DECRYPT_MODE, getOrCreateSecretKey(), GCMParameterSpec(GCM_TAG_BITS, iv))
+        cipher.updateAAD(prefKey.encodeToByteArray())
+        val decryptedBytes = cipher.doFinal(Base64.decode(ctB64, Base64.NO_WRAP))
+        try {
+          decryptedBytes.decodeToString()
+        } finally {
+          decryptedBytes.fill(0)
+        }
+      }.getOrNull()
+    }
+
+    // Smoothly migrate legacy plaintext JSON ("[...]") to AES-256-GCM on read.
+    val trimmed = stored.trimStart()
+    if (trimmed.startsWith("[")) {
+      writeEncryptedJson(prefKey, stored)
+      return stored
+    }
+    return null
+  }
+
+  private fun getOrCreateSecretKey(): SecretKey {
+    val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+    val existingEntry = keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
+    if (existingEntry != null) {
+      return existingEntry.secretKey
+    }
+    val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+    val spec = KeyGenParameterSpec.Builder(
+      KEY_ALIAS,
+      KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+    )
+      .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+      .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+      .setKeySize(256)
+      .build()
+    keyGenerator.init(spec)
+    return keyGenerator.generateKey()
   }
 
   companion object {
+    private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+    private const val KEY_ALIAS = "hm02_settings_contacts_aes_key"
+    private const val TRANSFORMATION = "AES/GCM/NoPadding"
+    private const val GCM_TAG_BITS = 128
+    private const val ENCRYPTED_PREFIX = "enc:v1:"
+    private const val MAX_SAVED_CONTACTS = 500
     private const val PREFS_FILE_NAME = "hm02_settings_and_contacts"
     private const val KEY_USER_SETTINGS = "user_settings_v1"
     private const val KEY_FLAGGED_EMAILS = "flagged_emails_v1"

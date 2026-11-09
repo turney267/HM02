@@ -28,6 +28,7 @@ class AccountStore(context: Context) {
   private val _accounts = MutableStateFlow(loadAccounts())
   val accounts: StateFlow<List<EmailAccount>> = _accounts.asStateFlow()
 
+  @Synchronized
   fun addOrUpdateAccount(account: EmailAccount) {
     val updated = _accounts.value.toMutableList().apply {
       val existingIndex = indexOfFirst { it.id == account.id || it.emailAddress.equals(account.emailAddress, ignoreCase = true) }
@@ -37,14 +38,17 @@ class AccountStore(context: Context) {
         add(account)
       }
     }
-    saveAccounts(updated)
-    _accounts.value = updated
+    if (saveAccounts(updated)) {
+      _accounts.value = updated
+    }
   }
 
+  @Synchronized
   fun removeAccount(accountId: String) {
     val updated = _accounts.value.filterNot { it.id == accountId }
-    saveAccounts(updated)
-    _accounts.value = updated
+    if (saveAccounts(updated)) {
+      _accounts.value = updated
+    }
   }
 
   private fun loadAccounts(): List<EmailAccount> {
@@ -55,21 +59,31 @@ class AccountStore(context: Context) {
       val iv = Base64.decode(ivBase64, Base64.NO_WRAP)
       cipher.init(Cipher.DECRYPT_MODE, getOrCreateSecretKey(), GCMParameterSpec(GCM_TAG_BITS, iv))
       val decryptedBytes = cipher.doFinal(Base64.decode(ciphertext, Base64.NO_WRAP))
-      json.decodeFromString<List<EmailAccount>>(decryptedBytes.decodeToString())
+      try {
+        json.decodeFromString<List<EmailAccount>>(decryptedBytes.decodeToString())
+      } finally {
+        decryptedBytes.fill(0)
+      }
     }.getOrDefault(emptyList())
   }
 
-  private fun saveAccounts(accounts: List<EmailAccount>) {
-    runCatching {
+  private fun saveAccounts(accounts: List<EmailAccount>): Boolean {
+    return runCatching {
       val plaintextBytes = json.encodeToString(accounts).encodeToByteArray()
-      val cipher = Cipher.getInstance(TRANSFORMATION)
-      cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSecretKey())
-      val ciphertextBytes = cipher.doFinal(plaintextBytes)
-      prefs.edit()
-        .putString(KEY_ACCOUNTS_CIPHERTEXT, Base64.encodeToString(ciphertextBytes, Base64.NO_WRAP))
-        .putString(KEY_ACCOUNTS_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-        .apply()
-    }
+      val ciphertextBytes = try {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSecretKey())
+        val encrypted = cipher.doFinal(plaintextBytes)
+        prefs.edit()
+          .putString(KEY_ACCOUNTS_CIPHERTEXT, Base64.encodeToString(encrypted, Base64.NO_WRAP))
+          .putString(KEY_ACCOUNTS_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+          .apply()
+        encrypted
+      } finally {
+        plaintextBytes.fill(0)
+      }
+      ciphertextBytes.isNotEmpty() || accounts.isEmpty()
+    }.getOrDefault(false)
   }
 
   private fun getOrCreateSecretKey(): SecretKey {

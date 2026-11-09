@@ -1,5 +1,6 @@
 package dev.hm02.mail.ui.main
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -7,29 +8,108 @@ import dev.hm02.mail.data.AccountStore
 import dev.hm02.mail.data.AccountSyncError
 import dev.hm02.mail.data.ImapSmtpMailClient
 import dev.hm02.mail.data.MailClient
+import dev.hm02.mail.data.MicrosoftOAuthHelper
 import dev.hm02.mail.data.SettingsAndContactsStore
 import dev.hm02.mail.model.ComposeMode
 import dev.hm02.mail.model.ContactSuggestion
 import dev.hm02.mail.model.EmailAccount
 import dev.hm02.mail.model.EmailDetail
 import dev.hm02.mail.model.EmailSummary
+import dev.hm02.mail.model.MailAuthType
+import dev.hm02.mail.model.MailProviderPreset
 import dev.hm02.mail.model.OutgoingEmailDraft
 import dev.hm02.mail.model.UserSettings
+import dev.hm02.mail.model.sanitizeHeaderControlChars
 import dev.hm02.mail.policy.MailPolicyConfig
 import dev.hm02.mail.policy.MailPolicyProvider
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.net.URLDecoder
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
+
+internal data class MailtoDraftFields(
+  val to: String = "",
+  val cc: String = "",
+  val subject: String = "",
+  val body: String = "",
+)
+
+internal fun parseMailtoUri(rawUri: String): MailtoDraftFields? {
+  val trimmed = rawUri.trim()
+  if (!trimmed.startsWith("mailto:", ignoreCase = true)) return null
+  val withoutScheme = trimmed.substring("mailto:".length).substringBefore('#')
+  val questionIdx = withoutScheme.indexOf('?')
+  val rawPathRecipients = if (questionIdx >= 0) withoutScheme.substring(0, questionIdx) else withoutScheme
+  val rawQuery = if (questionIdx >= 0 && questionIdx < withoutScheme.lastIndex) {
+    withoutScheme.substring(questionIdx + 1)
+  } else {
+    ""
+  }
+
+  fun decodePercent(component: String, decodePlusAsSpace: Boolean): String {
+    val prepared = if (decodePlusAsSpace) component else component.replace("+", "%2B")
+    return runCatching { URLDecoder.decode(prepared, "UTF-8") }.getOrDefault(component)
+  }
+
+  val toParts = mutableListOf<String>()
+  val decodedPathTo = sanitizeHeaderControlChars(decodePercent(rawPathRecipients, decodePlusAsSpace = false))
+  if (decodedPathTo.isNotBlank()) {
+    toParts.add(decodedPathTo)
+  }
+
+  val ccParts = mutableListOf<String>()
+  var subject = ""
+  var body = ""
+
+  if (rawQuery.isNotBlank()) {
+    for (pair in rawQuery.split('&')) {
+      if (pair.isBlank()) continue
+      val eqIdx = pair.indexOf('=')
+      val key = (if (eqIdx >= 0) pair.substring(0, eqIdx) else pair).lowercase(Locale.US)
+      val rawVal = if (eqIdx >= 0 && eqIdx < pair.lastIndex) pair.substring(eqIdx + 1) else ""
+      val decodedVal = decodePercent(rawVal, decodePlusAsSpace = false)
+      when (key) {
+        "to" -> {
+          val cleaned = sanitizeHeaderControlChars(decodedVal)
+          if (cleaned.isNotBlank()) toParts.add(cleaned)
+        }
+        "cc" -> {
+          val cleaned = sanitizeHeaderControlChars(decodedVal)
+          if (cleaned.isNotBlank()) ccParts.add(cleaned)
+        }
+        "subject" -> subject = sanitizeHeaderControlChars(decodedVal)
+        "body" -> body = decodedVal.replace("\u0000", "")
+      }
+    }
+  }
+
+  return MailtoDraftFields(
+    to = toParts.joinToString(", "),
+    cc = ccParts.joinToString(", "),
+    subject = subject,
+    body = body,
+  )
+}
 
 sealed interface ActivePane {
   data object Feed : ActivePane
   data class SearchResults(val query: String) : ActivePane
-  data class Reader(val summary: EmailSummary, val detail: EmailDetail?, val isLoading: Boolean, val error: String?) : ActivePane
+  data class Reader(
+    val summary: EmailSummary,
+    val detail: EmailDetail?,
+    val isLoading: Boolean,
+    val error: String?,
+    val returnSearchQuery: String? = null,
+  ) : ActivePane
   data class Composer(val initialDraft: OutgoingEmailDraft) : ActivePane
   data object Accounts : ActivePane
   data object Settings : ActivePane
@@ -40,7 +120,11 @@ data class HM02UiState(
   val policyName: String = "Recent (24h)",
   val policyEmptyDescription: String = "",
   val blockRemoteMediaInEmails: Boolean = true,
-  val blockExternalImagesByDefault: Boolean = false,
+  val blockExternalImagesByDefault: Boolean = true,
+  val forceBlockExternalImages: Boolean = false,
+  val allowExternalLinks: Boolean = true,
+  val maxSearchDays: Int = 2,
+  val allowCustomServers: Boolean = true,
   val settings: UserSettings = UserSettings(),
   val hasContactsPermission: Boolean = false,
   val savedContactsCount: Int = 0,
@@ -64,11 +148,24 @@ data class HM02UiState(
 class HM02ViewModel(
   private val accountStore: AccountStore,
   private val settingsAndContactsStore: SettingsAndContactsStore,
-  private val mailClient: MailClient = ImapSmtpMailClient(),
-  private val policyConfig: MailPolicyConfig = MailPolicyProvider.getConfig(),
+  private val mailClient: MailClient = ImapSmtpMailClient(
+    onAccountTokenUpdated = accountStore::addOrUpdateAccount,
+  ),
+  initialPolicyConfig: MailPolicyConfig = MailPolicyProvider.getConfig(),
 ) : ViewModel() {
 
+  @Volatile
+  private var policyConfig: MailPolicyConfig = initialPolicyConfig
+
   private var latestSyncedFeedItems: List<EmailSummary> = emptyList()
+
+  private val messageDetailCache: MutableMap<String, EmailDetail> =
+    Collections.synchronizedMap(
+      object : LinkedHashMap<String, EmailDetail>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, EmailDetail>?): Boolean =
+          size > MAX_CACHED_EMAIL_DETAILS
+      },
+    )
 
   private val _uiState = MutableStateFlow(
     HM02UiState(
@@ -77,6 +174,10 @@ class HM02ViewModel(
       policyEmptyDescription = policyConfig.feedPolicy.emptyStateDescription,
       blockRemoteMediaInEmails = policyConfig.blockRemoteMediaInEmails,
       blockExternalImagesByDefault = policyConfig.blockExternalImagesByDefault,
+      forceBlockExternalImages = policyConfig.forceBlockExternalImages,
+      allowExternalLinks = policyConfig.allowExternalLinks,
+      maxSearchDays = policyConfig.maxSearchDays,
+      allowCustomServers = policyConfig.allowCustomServers,
       settings = settingsAndContactsStore.settings.value,
       hasContactsPermission = settingsAndContactsStore.hasContactsPermission(),
       savedContactsCount = settingsAndContactsStore.savedContacts.value.size,
@@ -131,6 +232,27 @@ class HM02ViewModel(
     }
   }
 
+  fun updatePolicyConfig(newConfig: MailPolicyConfig) {
+    val previous = policyConfig
+    policyConfig = newConfig
+    _uiState.update { state ->
+      state.copy(
+        brandTitle = newConfig.brandTitle,
+        policyName = newConfig.feedPolicy.name,
+        policyEmptyDescription = newConfig.feedPolicy.emptyStateDescription,
+        blockRemoteMediaInEmails = newConfig.blockRemoteMediaInEmails,
+        blockExternalImagesByDefault = newConfig.blockExternalImagesByDefault,
+        forceBlockExternalImages = newConfig.forceBlockExternalImages,
+        allowExternalLinks = newConfig.allowExternalLinks,
+        maxSearchDays = newConfig.maxSearchDays,
+        allowCustomServers = newConfig.allowCustomServers,
+      )
+    }
+    if (previous != newConfig && accountStore.accounts.value.isNotEmpty()) {
+      refreshFeed()
+    }
+  }
+
   /**
    * Called automatically every time the user opens/resumes the app (ON_START)
    * or taps the manual refresh icon.
@@ -151,11 +273,11 @@ class HM02ViewModel(
       return
     }
 
+    val activeConfig = policyConfig
     viewModelScope.launch {
       _uiState.update { it.copy(isRefreshingFeed = true, statusMessage = null) }
-      val syncResult = mailClient.fetchFeed(accounts, policyConfig)
+      val syncResult = mailClient.fetchFeed(accounts, activeConfig)
       latestSyncedFeedItems = syncResult.items
-      settingsAndContactsStore.harvestSendersFromSummaries(syncResult.items)
       val failures = syncResult.failedAccounts
       val errorNotice = when {
         failures.isEmpty() -> null
@@ -164,6 +286,12 @@ class HM02ViewModel(
         else ->
           "Partial sync error (${failures.joinToString { it.accountEmail }})"
       }
+
+      val mergedFeed = mergeFeedWithFlagged(
+        syncedItems = latestSyncedFeedItems,
+        flaggedItems = settingsAndContactsStore.flaggedEmails.value,
+        enablePinToFeed = _uiState.value.settings.enablePinToFeed,
+      )
 
       _uiState.update { state ->
         state.copy(
@@ -178,11 +306,16 @@ class HM02ViewModel(
           statusMessage = errorNotice,
         )
       }
+
+      prefetchSummariesInBackground(mergedFeed)
     }
   }
 
   fun updateSearchQuery(query: String) {
-    val suggestions = settingsAndContactsStore.querySenderSearchSuggestions(query)
+    val suggestions = settingsAndContactsStore.querySenderSearchSuggestions(
+      rawQuery = query,
+      maxSearchDays = policyConfig.maxSearchDays,
+    )
     _uiState.update {
       it.copy(
         searchQuery = query,
@@ -205,7 +338,7 @@ class HM02ViewModel(
     val query = _uiState.value.searchQuery.trim()
     val accounts = accountStore.accounts.value
     if (query.isEmpty()) {
-      showFeed()
+      clearSearchAndReturnToFeed()
       return
     }
     if (accounts.isEmpty()) {
@@ -217,15 +350,19 @@ class HM02ViewModel(
       _uiState.update {
         it.copy(
           isSearching = true,
+          searchResults = emptyList(),
           searchSuggestions = emptyList(),
           activePane = ActivePane.SearchResults(query),
           statusMessage = null,
         )
       }
-      val result = mailClient.searchMessages(accounts, query)
+      val result = mailClient.searchMessages(
+        accounts = accounts,
+        query = query,
+        maxSearchDays = policyConfig.maxSearchDays,
+      )
       result.fold(
         onSuccess = { items ->
-          settingsAndContactsStore.harvestSendersFromSummaries(items)
           val flaggedKeys = settingsAndContactsStore.flaggedEmails.value
             .map { it.compositeKey }
             .toSet()
@@ -238,6 +375,7 @@ class HM02ViewModel(
               isSearching = false,
             )
           }
+          prefetchSummariesInBackground(decoratedItems.take(MAX_SEARCH_PREFETCH_ITEMS))
         },
         onFailure = { error ->
           _uiState.update {
@@ -259,6 +397,22 @@ class HM02ViewModel(
         searchResults = emptyList(),
         activePane = ActivePane.Feed,
       )
+    }
+  }
+
+  fun closeReader() {
+    val currentReader = _uiState.value.activePane as? ActivePane.Reader
+    val returnQuery = currentReader?.returnSearchQuery
+    if (!returnQuery.isNullOrBlank()) {
+      _uiState.update {
+        it.copy(
+          activePane = ActivePane.SearchResults(returnQuery),
+          contactSuggestions = emptyList(),
+          searchSuggestions = emptyList(),
+        )
+      }
+    } else {
+      showFeed()
     }
   }
 
@@ -293,9 +447,7 @@ class HM02ViewModel(
 
   fun updateRememberSenders(enabled: Boolean) {
     settingsAndContactsStore.updateSettings { it.copy(rememberSenders = enabled) }
-    if (enabled) {
-      settingsAndContactsStore.harvestSendersFromSummaries(latestSyncedFeedItems + _uiState.value.searchResults)
-    } else {
+    if (!enabled) {
       _uiState.update { it.copy(searchSuggestions = emptyList()) }
     }
   }
@@ -308,6 +460,11 @@ class HM02ViewModel(
     val nowFlagged = settingsAndContactsStore.toggleFlaggedEmail(email)
     latestSyncedFeedItems = latestSyncedFeedItems.map {
       if (it.compositeKey == email.compositeKey) it.copy(isFlagged = nowFlagged) else it
+    }
+    messageDetailCache[email.compositeKey]?.let { cached ->
+      messageDetailCache[email.compositeKey] = cached.copy(
+        summary = cached.summary.copy(isFlagged = nowFlagged),
+      )
     }
     _uiState.update { state ->
       val updatedPane = when (val pane = state.activePane) {
@@ -374,6 +531,50 @@ class HM02ViewModel(
     val account = accountStore.accounts.value.find { it.id == summary.accountId } ?: return
     val isCurrentlyFlagged = summary.isFlagged || settingsAndContactsStore.isEmailFlagged(summary.compositeKey)
     val hydratedSummary = summary.copy(isFlagged = isCurrentlyFlagged)
+    val returnSearchQuery = when (val currentPane = _uiState.value.activePane) {
+      is ActivePane.SearchResults -> currentPane.query
+      is ActivePane.Reader -> currentPane.returnSearchQuery
+      else -> null
+    }
+
+    val cachedDetail = messageDetailCache[summary.compositeKey]
+    if (cachedDetail != null) {
+      settingsAndContactsStore.markFlaggedEmailRead(summary.compositeKey)
+      latestSyncedFeedItems = latestSyncedFeedItems.map {
+        if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
+      }
+      val flaggedNow = cachedDetail.summary.isFlagged || isCurrentlyFlagged
+      val updatedSummary = cachedDetail.summary.copy(isUnread = false, isFlagged = flaggedNow)
+      val updatedDetail = cachedDetail.copy(summary = updatedSummary)
+      messageDetailCache[summary.compositeKey] = updatedDetail
+
+      _uiState.update { state ->
+        state.copy(
+          feedItems = mergeFeedWithFlagged(
+            syncedItems = latestSyncedFeedItems,
+            flaggedItems = settingsAndContactsStore.flaggedEmails.value,
+            enablePinToFeed = state.settings.enablePinToFeed,
+          ),
+          searchResults = state.searchResults.map {
+            if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
+          },
+          activePane = ActivePane.Reader(
+            summary = updatedSummary,
+            detail = updatedDetail,
+            isLoading = false,
+            error = null,
+            returnSearchQuery = returnSearchQuery,
+          ),
+        )
+      }
+
+      if (summary.isUnread) {
+        viewModelScope.launch {
+          mailClient.markMessageRead(account, summary.uid)
+        }
+      }
+      return
+    }
 
     viewModelScope.launch {
       _uiState.update {
@@ -383,13 +584,13 @@ class HM02ViewModel(
             detail = null,
             isLoading = true,
             error = null,
+            returnSearchQuery = returnSearchQuery,
           ),
         )
       }
       val result = mailClient.fetchMessageDetail(account, summary.uid)
       result.fold(
         onSuccess = { detail ->
-          settingsAndContactsStore.harvestContactsFromEmail(detail)
           settingsAndContactsStore.markFlaggedEmailRead(summary.compositeKey)
           latestSyncedFeedItems = latestSyncedFeedItems.map {
             if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
@@ -397,6 +598,7 @@ class HM02ViewModel(
           val flaggedNow = detail.summary.isFlagged || settingsAndContactsStore.isEmailFlagged(summary.compositeKey)
           val updatedSummary = detail.summary.copy(isUnread = false, isFlagged = flaggedNow)
           val updatedDetail = detail.copy(summary = updatedSummary)
+          messageDetailCache[summary.compositeKey] = updatedDetail
 
           _uiState.update { state ->
             state.copy(
@@ -413,6 +615,7 @@ class HM02ViewModel(
                 detail = updatedDetail,
                 isLoading = false,
                 error = null,
+                returnSearchQuery = returnSearchQuery,
               ),
             )
           }
@@ -425,6 +628,7 @@ class HM02ViewModel(
                 detail = null,
                 isLoading = false,
                 error = error.localizedMessage ?: "Failed to load email body.",
+                returnSearchQuery = returnSearchQuery,
               ),
             )
           }
@@ -453,6 +657,41 @@ class HM02ViewModel(
             to = "",
             subject = "",
             body = "",
+            mode = ComposeMode.NEW,
+          ),
+        ),
+      )
+    }
+  }
+
+  fun startComposeFromMailto(
+    to: String,
+    cc: String = "",
+    subject: String = "",
+    body: String = "",
+  ) {
+    val readerAccountId = (_uiState.value.activePane as? ActivePane.Reader)?.summary?.accountId
+    val selectedAccount = accountStore.accounts.value.find { it.id == readerAccountId }
+      ?: accountStore.accounts.value.firstOrNull()
+    if (selectedAccount == null) {
+      _uiState.update {
+        it.copy(
+          activePane = ActivePane.Accounts,
+          statusMessage = "Add an email account before composing.",
+        )
+      }
+      return
+    }
+    _uiState.update {
+      it.copy(
+        contactSuggestions = emptyList(),
+        activePane = ActivePane.Composer(
+          OutgoingEmailDraft(
+            fromAccount = selectedAccount,
+            to = sanitizeHeaderControlChars(to),
+            cc = sanitizeHeaderControlChars(cc),
+            subject = sanitizeHeaderControlChars(subject),
+            body = body,
             mode = ComposeMode.NEW,
           ),
         ),
@@ -558,7 +797,31 @@ class HM02ViewModel(
     }
   }
 
-  fun verifyAndSaveAccount(account: EmailAccount, skipVerification: Boolean = false) {
+  fun verifyAndSaveAccount(
+    account: EmailAccount,
+    skipVerification: Boolean = false,
+    onSuccess: () -> Unit = {},
+  ) {
+    val activePolicy = policyConfig
+    if (!activePolicy.allowCustomServers) {
+      val matchedPreset = MailProviderPreset.entries.firstOrNull { preset ->
+        preset != MailProviderPreset.CUSTOM &&
+          preset.imapHost.equals(account.imapHost.trim(), ignoreCase = true) &&
+          preset.imapPort == account.imapPort &&
+          preset.smtpHost.equals(account.smtpHost.trim(), ignoreCase = true) &&
+          preset.smtpPort == account.smtpPort
+      }
+      if (matchedPreset == null) {
+        _uiState.update {
+          it.copy(
+            isVerifyingAccount = false,
+            statusMessage = "Custom IMAP/SMTP servers are disabled by device policy.",
+          )
+        }
+        return
+      }
+    }
+
     viewModelScope.launch {
       if (!skipVerification) {
         _uiState.update { it.copy(isVerifyingAccount = true, statusMessage = "Testing IMAP connection...") }
@@ -575,6 +838,7 @@ class HM02ViewModel(
         }
       }
       accountStore.addOrUpdateAccount(account)
+      onSuccess()
       _uiState.update {
         it.copy(
           isVerifyingAccount = false,
@@ -585,14 +849,140 @@ class HM02ViewModel(
     }
   }
 
+  fun completeMicrosoftOAuthSignIn(
+    authorizationCode: String,
+    codeVerifier: String,
+    fallbackEmail: String,
+    fallbackDisplayName: String,
+    onSuccess: () -> Unit = {},
+  ) {
+    viewModelScope.launch {
+      _uiState.update {
+        it.copy(
+          isVerifyingAccount = true,
+          statusMessage = "Completing Microsoft sign-in...",
+        )
+      }
+      val tokenResult = MicrosoftOAuthHelper.exchangeAuthorizationCode(
+        code = authorizationCode,
+        codeVerifier = codeVerifier,
+      )
+      if (tokenResult.isFailure) {
+        val reason = tokenResult.exceptionOrNull()?.localizedMessage ?: "Failed to exchange Microsoft OAuth code"
+        _uiState.update {
+          it.copy(
+            isVerifyingAccount = false,
+            statusMessage = "Microsoft sign-in failed: $reason",
+          )
+        }
+        return@launch
+      }
+
+      val token = tokenResult.getOrThrow()
+      val resolvedEmail = token.emailAddress?.trim()?.takeIf { it.isNotBlank() }
+        ?: fallbackEmail.trim()
+      if (resolvedEmail.isBlank()) {
+        _uiState.update {
+          it.copy(
+            isVerifyingAccount = false,
+            statusMessage = "Please enter your Outlook email address before signing in.",
+          )
+        }
+        return@launch
+      }
+      val resolvedName = fallbackDisplayName.trim()
+        .ifBlank { token.displayName?.trim().orEmpty() }
+        .ifBlank { resolvedEmail }
+
+      val newAccount = EmailAccount(
+        displayName = resolvedName,
+        emailAddress = resolvedEmail,
+        imapHost = MailProviderPreset.OUTLOOK.imapHost,
+        imapPort = MailProviderPreset.OUTLOOK.imapPort,
+        smtpHost = MailProviderPreset.OUTLOOK.smtpHost,
+        smtpPort = MailProviderPreset.OUTLOOK.smtpPort,
+        appPassword = "",
+        preset = MailProviderPreset.OUTLOOK,
+        authType = MailAuthType.OAUTH2_MICROSOFT,
+        oauthRefreshToken = token.refreshToken,
+        oauthAccessToken = token.accessToken,
+        oauthTokenExpiresAtMillis = token.expiresAtEpochMillis,
+      )
+
+      _uiState.update {
+        it.copy(
+          isVerifyingAccount = true,
+          statusMessage = "Testing Outlook IMAP connection...",
+        )
+      }
+      val verifyResult = mailClient.verifyAccount(newAccount)
+      if (verifyResult.isFailure) {
+        val reason = verifyResult.exceptionOrNull()?.localizedMessage ?: "IMAP XOAUTH2 verification failed"
+        _uiState.update {
+          it.copy(
+            isVerifyingAccount = false,
+            statusMessage = "Outlook connection failed: $reason",
+          )
+        }
+        return@launch
+      }
+
+      accountStore.addOrUpdateAccount(newAccount)
+      onSuccess()
+      _uiState.update {
+        it.copy(
+          isVerifyingAccount = false,
+          statusMessage = "Saved Outlook account $resolvedEmail",
+        )
+      }
+      refreshFeed()
+    }
+  }
+
   fun removeAccount(accountId: String) {
     accountStore.removeAccount(accountId)
     settingsAndContactsStore.removeFlaggedForAccount(accountId)
+    synchronized(messageDetailCache) {
+      messageDetailCache.keys.removeAll { it.startsWith("$accountId:") }
+    }
+    _uiState.update { state ->
+      state.copy(
+        searchResults = state.searchResults.filterNot { it.accountId == accountId },
+      )
+    }
     refreshFeed()
   }
 
   fun dismissStatusMessage() {
     _uiState.update { it.copy(statusMessage = null) }
+  }
+
+  private fun prefetchSummariesInBackground(items: List<EmailSummary>) {
+    val uncached = items.filter { !messageDetailCache.containsKey(it.compositeKey) }
+    if (uncached.isEmpty()) return
+
+    val accountsById = accountStore.accounts.value.associateBy { it.id }
+    val groupedByAccount = uncached.groupBy { it.accountId }
+
+    viewModelScope.launch {
+      coroutineScope {
+        groupedByAccount.mapNotNull { (accountId, accountSummaries) ->
+          val account = accountsById[accountId] ?: return@mapNotNull null
+          val uids = accountSummaries.map { it.uid }.distinct().take(MAX_PREFETCH_PER_ACCOUNT)
+          async {
+            val prefetched = mailClient.prefetchMessages(account, uids)
+            for ((uid, detail) in prefetched) {
+              val key = "$accountId:$uid"
+              val isFlagged = detail.summary.isFlagged || settingsAndContactsStore.isEmailFlagged(key)
+              val hydratedDetail = detail.copy(
+                summary = detail.summary.copy(isFlagged = isFlagged),
+              )
+              messageDetailCache[key] = hydratedDetail
+            }
+          }
+        }.awaitAll()
+      }
+    }
   }
 
   private fun mergeFeedWithFlagged(
@@ -640,6 +1030,29 @@ class HM02ViewModel(
   }
 
   companion object {
+    private const val MAX_CACHED_EMAIL_DETAILS = 100
+    private const val MAX_PREFETCH_PER_ACCOUNT = 20
+    private const val MAX_SEARCH_PREFETCH_ITEMS = 15
+
+    fun provideFactory(
+      context: Context,
+      policyConfigProvider: () -> MailPolicyConfig = { MailPolicyProvider.getConfig() },
+    ): ViewModelProvider.Factory {
+      val appContext = context.applicationContext
+      return object : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(modelClass: Class<T>): T {
+          val store = AccountStore(appContext)
+          return HM02ViewModel(
+            accountStore = store,
+            settingsAndContactsStore = SettingsAndContactsStore(appContext),
+            mailClient = ImapSmtpMailClient(onAccountTokenUpdated = store::addOrUpdateAccount),
+            initialPolicyConfig = policyConfigProvider(),
+          ) as T
+        }
+      }
+    }
+
     fun provideFactory(
       accountStore: AccountStore,
       settingsAndContactsStore: SettingsAndContactsStore,
@@ -650,8 +1063,8 @@ class HM02ViewModel(
         return HM02ViewModel(
           accountStore = accountStore,
           settingsAndContactsStore = settingsAndContactsStore,
-          mailClient = ImapSmtpMailClient(),
-          policyConfig = policyConfig,
+          mailClient = ImapSmtpMailClient(onAccountTokenUpdated = accountStore::addOrUpdateAccount),
+          initialPolicyConfig = policyConfig,
         ) as T
       }
     }

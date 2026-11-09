@@ -10,12 +10,20 @@ import dev.hm02.mail.model.EmailSummary
  * - [feedPolicy]: Time window for the main feed (e.g. 10-minute lookback).
  * - [blockRemoteMediaInEmails]: Strips `<video>`, `<audio>`, `<iframe>`, and `<object>` elements when rendering HTML emails.
  * - [blockExternalImagesByDefault]: Whether external images in HTML emails are blocked by default.
+ * - [forceBlockExternalImages]: When `true`, strictly blocks external images without allowing per-email opt-in.
+ * - [allowExternalLinks]: Whether tapping `http(s)` links in HTML emails may launch an external browser.
+ * - [maxSearchDays]: Maximum day lookback permitted via `"a"` / `"a<N>"` quick day-range search shortcuts.
+ * - [allowCustomServers]: Whether users may configure arbitrary custom IMAP/SMTP hosts instead of built-in provider presets.
  */
 data class MailPolicyConfig(
   val brandTitle: String = "HM02",
   val feedPolicy: FeedPolicy = DefaultFeedPolicy,
   val blockRemoteMediaInEmails: Boolean = true,
-  val blockExternalImagesByDefault: Boolean = false,
+  val blockExternalImagesByDefault: Boolean = true,
+  val forceBlockExternalImages: Boolean = false,
+  val allowExternalLinks: Boolean = true,
+  val maxSearchDays: Int = 2,
+  val allowCustomServers: Boolean = true,
 ) {
   /**
    * Evaluates whether [message] should appear in the main feed at [refreshTimestampMillis]

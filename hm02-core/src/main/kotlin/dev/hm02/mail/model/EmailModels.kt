@@ -3,8 +3,13 @@ package dev.hm02.mail.model
 import kotlinx.serialization.Serializable
 import java.util.UUID
 
+enum class MailAuthType {
+  APP_PASSWORD,
+  OAUTH2_MICROSOFT,
+}
+
 /**
- * Built-in server presets for common email providers that support IMAP/SMTP with App Passwords.
+ * Built-in server presets for common email providers that support IMAP/SMTP with App Passwords or OAuth2.
  */
 enum class MailProviderPreset(
   val label: String,
@@ -14,6 +19,7 @@ enum class MailProviderPreset(
   val smtpPort: Int = 465,
   val appPasswordUrl: String?,
   val setupHint: String,
+  val authType: MailAuthType = MailAuthType.APP_PASSWORD,
 ) {
   GMAIL(
     label = "Gmail / Google Workspace",
@@ -30,8 +36,9 @@ enum class MailProviderPreset(
     imapPort = 993,
     smtpHost = "smtp.office365.com",
     smtpPort = 587,
-    appPasswordUrl = "https://account.live.com/proofs/manage/additional",
-    setupHint = "Create an App Password under Microsoft Account -> Security -> Advanced security options.",
+    appPasswordUrl = null,
+    setupHint = "Microsoft requires OAuth2 Modern Authentication for Outlook, Hotmail, Live, and Microsoft 365 accounts. Tap Sign in with Microsoft below.",
+    authType = MailAuthType.OAUTH2_MICROSOFT,
   ),
   ICLOUD(
     label = "iCloud Mail",
@@ -71,6 +78,24 @@ enum class MailProviderPreset(
   ),
 }
 
+typealias ProviderPreset = MailProviderPreset
+
+/**
+ * Strips CR, LF, NUL, and Unicode bidirectional override characters from header/address text.
+ */
+internal fun sanitizeHeaderControlChars(value: String): String =
+  buildString(value.length) {
+    for (ch in value) {
+      if (ch == '\r' || ch == '\n' || ch == '\t') {
+        if (isNotEmpty() && last() != ' ') append(' ')
+        continue
+      }
+      if (ch.code < 0x20 || ch.code == 0x7F) continue
+      if (ch in '\u202A'..'\u202E' || ch in '\u2066'..'\u2069') continue
+      append(ch)
+    }
+  }.trim()
+
 /**
  * Represents a configured user email account stored encrypted on-device.
  */
@@ -83,12 +108,32 @@ data class EmailAccount(
   val imapPort: Int = 993,
   val smtpHost: String,
   val smtpPort: Int = 465,
-  val appPassword: String,
+  val appPassword: String = "",
   val useSsl: Boolean = true,
+  val preset: MailProviderPreset? = null,
+  val authType: MailAuthType = MailAuthType.APP_PASSWORD,
+  val oauthRefreshToken: String? = null,
+  val oauthAccessToken: String? = null,
+  val oauthTokenExpiresAtMillis: Long = 0L,
 ) {
   val isGmail: Boolean
     get() = imapHost.contains("gmail.com", ignoreCase = true) ||
       imapHost.contains("googlemail.com", ignoreCase = true)
+
+  val effectivePreset: MailProviderPreset
+    get() = preset ?: MailProviderPreset.entries.firstOrNull { candidate ->
+      candidate != MailProviderPreset.CUSTOM &&
+        candidate.imapHost.equals(imapHost.trim(), ignoreCase = true) &&
+        candidate.smtpHost.equals(smtpHost.trim(), ignoreCase = true)
+    } ?: MailProviderPreset.CUSTOM
+
+  val isOAuth2: Boolean
+    get() = authType == MailAuthType.OAUTH2_MICROSOFT || !oauthRefreshToken.isNullOrBlank()
+
+  override fun toString(): String =
+    "EmailAccount(id=$id, displayName=$displayName, emailAddress=$emailAddress, " +
+      "imapHost=$imapHost, imapPort=$imapPort, smtpHost=$smtpHost, smtpPort=$smtpPort, " +
+      "password=***, authType=$authType, useSsl=$useSsl, preset=${effectivePreset.name})"
 }
 
 /**
@@ -108,6 +153,7 @@ data class EmailSummary(
   val receivedAtEpochMillis: Long,
   val isUnread: Boolean,
   val isFlagged: Boolean = false,
+  val replyToAddress: String? = null,
 ) {
   val compositeKey: String
     get() = "$accountId:$uid"
@@ -167,9 +213,16 @@ data class ContactSuggestion(
   val source: String = "Saved",
 ) {
   val formatted: String
-    get() = if (name.isNotBlank() && !name.equals(emailAddress, ignoreCase = true)) {
-      "$name <$emailAddress>"
-    } else {
-      emailAddress
+    get() {
+      val cleanName = sanitizeHeaderControlChars(name)
+      val cleanEmail = sanitizeHeaderControlChars(emailAddress).replace(" ", "")
+      return if (cleanName.isNotBlank() && !cleanName.equals(cleanEmail, ignoreCase = true)) {
+        val escapedName = cleanName
+          .replace("\\", "\\\\")
+          .replace("\"", "\\\"")
+        "\"$escapedName\" <$cleanEmail>"
+      } else {
+        cleanEmail
+      }
     }
 }

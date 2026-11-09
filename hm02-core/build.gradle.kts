@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.github.turney267"
-version = "1.0.0"
+version = "1.1.0"
 
 android {
   namespace = "dev.hm02.mail.core"
@@ -96,7 +96,7 @@ afterEvaluate {
       register<MavenPublication>("release") {
         groupId = "com.github.turney267"
         artifactId = "hm02-core"
-        version = "1.0.0"
+        version = "1.1.0"
         from(components["release"])
       }
     }

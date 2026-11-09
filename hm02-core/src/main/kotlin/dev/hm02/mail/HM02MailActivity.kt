@@ -7,9 +7,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
-import androidx.lifecycle.viewmodel.compose.viewModel
-import dev.hm02.mail.data.AccountStore
-import dev.hm02.mail.data.SettingsAndContactsStore
+import androidx.lifecycle.ViewModelProvider
 import dev.hm02.mail.policy.MailPolicyConfig
 import dev.hm02.mail.policy.MailPolicyProvider
 import dev.hm02.mail.ui.main.HM02AppScreen
@@ -26,14 +24,22 @@ import dev.hm02.mail.ui.theme.LocalSurfColors
  */
 open class HM02MailActivity : ComponentActivity() {
 
+  protected lateinit var hm02ViewModel: HM02ViewModel
+
   protected open fun resolvePolicyConfig(): MailPolicyConfig = MailPolicyProvider.getConfig()
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
 
-    val accountStore = AccountStore(applicationContext)
-    val settingsAndContactsStore = SettingsAndContactsStore(applicationContext)
-    val policyConfig = resolvePolicyConfig()
+    val initialPolicyConfig = resolvePolicyConfig()
+    hm02ViewModel = ViewModelProvider(
+      this,
+      HM02ViewModel.provideFactory(
+        context = applicationContext,
+        policyConfigProvider = ::resolvePolicyConfig,
+      ),
+    )[HM02ViewModel::class.java]
+    hm02ViewModel.updatePolicyConfig(initialPolicyConfig)
 
     enableEdgeToEdge()
     setContent {
@@ -43,16 +49,21 @@ open class HM02MailActivity : ComponentActivity() {
           modifier = Modifier.fillMaxSize(),
           color = surfColors.pageBg,
         ) {
-          val hm02ViewModel: HM02ViewModel = viewModel(
-            factory = HM02ViewModel.provideFactory(
-              accountStore = accountStore,
-              settingsAndContactsStore = settingsAndContactsStore,
-              policyConfig = policyConfig,
-            ),
-          )
           HM02AppScreen(viewModel = hm02ViewModel)
         }
       }
+    }
+  }
+
+  override fun onResume() {
+    super.onResume()
+    refreshManagedPolicyConfig()
+  }
+
+  protected fun refreshManagedPolicyConfig() {
+    val updatedConfig = resolvePolicyConfig()
+    if (::hm02ViewModel.isInitialized) {
+      hm02ViewModel.updatePolicyConfig(updatedConfig)
     }
   }
 }

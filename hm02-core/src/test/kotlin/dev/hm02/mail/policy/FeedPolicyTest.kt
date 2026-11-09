@@ -3,6 +3,7 @@ package dev.hm02.mail.policy
 import dev.hm02.mail.data.computeDayWindowStartMillis
 import dev.hm02.mail.data.parseQuickDaySearchDays
 import dev.hm02.mail.model.EmailSummary
+import dev.hm02.mail.ui.main.formatElapsedSince
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -83,5 +84,18 @@ class FeedPolicyTest {
 
     assertTrue(startToday <= now)
     assertEquals(1.days.inWholeMilliseconds, startToday - startYesterday)
+  }
+
+  @Test
+  fun `formatElapsedSince returns just now under 1 minute and increments in whole minutes`() {
+    val base = 1_700_000_000_000L
+    assertEquals("just now", formatElapsedSince(base, base))
+    assertEquals("just now", formatElapsedSince(base, base + 5_000L))
+    assertEquals("just now", formatElapsedSince(base, base + 59_000L))
+    assertEquals("1 minute ago", formatElapsedSince(base, base + 60_000L))
+    assertEquals("1 minute ago", formatElapsedSince(base, base + 119_000L))
+    assertEquals("2 minutes ago", formatElapsedSince(base, base + 120_000L))
+    assertEquals("59 minutes ago", formatElapsedSince(base, base + 59 * 60_000L))
+    assertEquals("1h ago", formatElapsedSince(base, base + 60 * 60_000L))
   }
 }
