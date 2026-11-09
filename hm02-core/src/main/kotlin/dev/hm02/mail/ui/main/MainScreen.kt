@@ -1800,6 +1800,62 @@ private fun SettingsPane(
       }
 
       HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+
+      val policyConfig = dev.hm02.mail.policy.MailPolicyProvider.getConfig()
+      val updateHandler = policyConfig.onCheckForAppUpdate
+      if (updateHandler != null) {
+        val context = LocalContext.current
+        val versionName = remember(context) {
+          try {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "1.0"
+          } catch (_: Exception) {
+            "1.0"
+          }
+        }
+        var isUpdating by remember { mutableStateOf(false) }
+        var updateStatusText by remember { mutableStateOf("${policyConfig.brandTitle} v$versionName") }
+
+        Row(
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 16.dp),
+          horizontalArrangement = Arrangement.SpaceBetween,
+          verticalAlignment = Alignment.CenterVertically,
+        ) {
+          Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(
+              text = "App Update",
+              style = MaterialTheme.typography.bodyLarge,
+              color = surfColors.primaryText,
+            )
+            Text(
+              text = updateStatusText,
+              fontFamily = FontFamily.Monospace,
+              fontSize = 11.sp,
+              color = surfColors.secondaryText,
+              modifier = Modifier.padding(top = 2.dp),
+            )
+          }
+          SurfPillButton(
+            label = if (isUpdating) "Checking..." else "Update App",
+            enabled = !isUpdating,
+            onClick = {
+              isUpdating = true
+              updateStatusText = "Checking for updates..."
+              updateHandler(
+                context,
+                { status: String -> updateStatusText = status },
+                { _: Boolean, finalMessage: String ->
+                  isUpdating = false
+                  updateStatusText = finalMessage
+                },
+              )
+            },
+          )
+        }
+
+        HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
+      }
     }
   }
 }

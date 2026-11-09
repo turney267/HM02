@@ -1,5 +1,6 @@
 package dev.hm02.mail.policy
 
+import android.content.Context
 import dev.hm02.mail.model.EmailSummary
 
 /**
@@ -14,6 +15,7 @@ import dev.hm02.mail.model.EmailSummary
  * - [allowExternalLinks]: Whether tapping `http(s)` links in HTML emails may launch an external browser.
  * - [maxSearchDays]: Maximum day lookback permitted via `"a"` / `"a<N>"` quick day-range search shortcuts.
  * - [allowCustomServers]: Whether users may configure arbitrary custom IMAP/SMTP hosts instead of built-in provider presets.
+ * - [onCheckForAppUpdate]: Optional host callback for checking and installing app updates from Settings.
  */
 data class MailPolicyConfig(
   val brandTitle: String = "HM02",
@@ -24,6 +26,7 @@ data class MailPolicyConfig(
   val allowExternalLinks: Boolean = true,
   val maxSearchDays: Int = 2,
   val allowCustomServers: Boolean = true,
+  val onCheckForAppUpdate: ((Context, (String) -> Unit, (Boolean, String) -> Unit) -> Unit)? = null,
 ) {
   /**
    * Evaluates whether [message] should appear in the main feed at [refreshTimestampMillis]
