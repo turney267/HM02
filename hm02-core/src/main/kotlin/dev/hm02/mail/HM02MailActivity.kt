@@ -32,6 +32,7 @@ open class HM02MailActivity : ComponentActivity() {
     super.onCreate(savedInstanceState)
 
     val initialPolicyConfig = resolvePolicyConfig()
+    MailPolicyProvider.configure(initialPolicyConfig)
     hm02ViewModel = ViewModelProvider(
       this,
       HM02ViewModel.provideFactory(
@@ -62,6 +63,7 @@ open class HM02MailActivity : ComponentActivity() {
 
   protected fun refreshManagedPolicyConfig() {
     val updatedConfig = resolvePolicyConfig()
+    MailPolicyProvider.configure(updatedConfig)
     if (::hm02ViewModel.isInitialized) {
       hm02ViewModel.updatePolicyConfig(updatedConfig)
     }
