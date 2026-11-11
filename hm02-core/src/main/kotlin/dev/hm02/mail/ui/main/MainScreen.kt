@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Intent
 import android.net.Uri
 import android.provider.ContactsContract
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -2322,12 +2324,72 @@ private fun MicrosoftOAuthSignInSheet(
       factory = { ctx ->
         WebView(ctx).apply {
           webViewRef = this
+          setBackgroundColor(android.graphics.Color.WHITE)
+          val cookieManager = CookieManager.getInstance()
+          cookieManager.setAcceptCookie(true)
+          cookieManager.setAcceptThirdPartyCookies(this, true)
+
           settings.javaScriptEnabled = true
           settings.domStorageEnabled = true
+          settings.javaScriptCanOpenWindowsAutomatically = true
+          settings.loadWithOverviewMode = true
+          settings.useWideViewPort = true
           settings.allowFileAccess = false
           settings.allowContentAccess = false
+          settings.userAgentString = MicrosoftOAuthHelper.sanitizeWebViewUserAgent(
+            settings.userAgentString.orEmpty(),
+          )
+          webChromeClient = WebChromeClient()
           webViewClient = object : WebViewClient() {
             private var handledRedirect = false
+
+            private val webViewCompatShimJs = """
+              (function() {
+                try {
+                  delete window.PublicKeyCredential;
+                  if (window.Window && window.Window.prototype) {
+                    delete window.Window.prototype.PublicKeyCredential;
+                  }
+                  Object.defineProperty(window, 'PublicKeyCredential', {
+                    value: undefined,
+                    configurable: true,
+                    writable: true
+                  });
+                } catch (e) {}
+                try {
+                  if (window.ServerData) {
+                    window.ServerData.fIsFidoSupported = false;
+                    window.ServerData.fEnableCssAnimation = false;
+                  }
+                  if (window.${'$'}Config) {
+                    window.${'$'}Config.fIsFidoSupported = false;
+                    window.${'$'}Config.fEnableCssAnimation = false;
+                  }
+                } catch (e) {}
+                try {
+                  if (!window.__hm02AnimGuardInstalled) {
+                    window.__hm02AnimGuardInstalled = true;
+                    document.addEventListener('animationstart', function(ev) {
+                      var target = ev.target;
+                      if (!target) return;
+                      setTimeout(function() {
+                        try {
+                          target.dispatchEvent(new AnimationEvent('animationend', {
+                            animationName: ev.animationName,
+                            elapsedTime: 0.3,
+                            bubbles: true
+                          }));
+                        } catch (err) {}
+                      }, 280);
+                    }, true);
+                  }
+                } catch (e) {}
+              })();
+            """.trimIndent()
+
+            private fun injectCompatShim(view: WebView?) {
+              view?.evaluateJavascript(webViewCompatShimJs, null)
+            }
 
             private fun handlePotentialRedirect(uri: Uri?): Boolean {
               if (handledRedirect || uri == null) return false
@@ -2372,13 +2434,27 @@ private fun MicrosoftOAuthSignInSheet(
             ) {
               super.onPageStarted(view, url, favicon)
               isPageLoading = true
-              if (url != null) {
-                handlePotentialRedirect(Uri.parse(url))
+              if (url != null && handlePotentialRedirect(Uri.parse(url))) {
+                return
+              }
+              injectCompatShim(view)
+            }
+
+            override fun onPageCommitVisible(view: WebView?, url: String?) {
+              super.onPageCommitVisible(view, url)
+              injectCompatShim(view)
+            }
+
+            override fun onLoadResource(view: WebView?, url: String?) {
+              super.onLoadResource(view, url)
+              if (url != null && (url.contains(".js") || url.contains("authorize") || url.contains("GetCredentialType"))) {
+                injectCompatShim(view)
               }
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
               super.onPageFinished(view, url)
+              injectCompatShim(view)
               isPageLoading = false
             }
           }

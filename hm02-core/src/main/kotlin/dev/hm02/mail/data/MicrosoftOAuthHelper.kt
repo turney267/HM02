@@ -71,7 +71,30 @@ object MicrosoftOAuthHelper {
     )
   }
 
+  private val CONSUMER_DOMAIN_PREFIXES = listOf(
+    "outlook.",
+    "hotmail.",
+    "live.",
+    "msn.",
+    "passport.",
+  )
+
+  internal fun isConsumerMicrosoftEmail(email: String): Boolean {
+    val domain = email.trim().substringAfter('@', "").lowercase()
+    if (domain.isEmpty()) return false
+    return CONSUMER_DOMAIN_PREFIXES.any { prefix -> domain.startsWith(prefix) }
+  }
+
+  internal fun sanitizeWebViewUserAgent(rawUserAgent: String): String =
+    rawUserAgent
+      .replace("; wv)", ")")
+      .replace("; wv;", ";")
+      .replace(Regex("\\s*Version/\\d+\\.\\d+\\s*"), " ")
+      .replace(Regex("\\s+"), " ")
+      .trim()
+
   fun buildAuthorizationUrl(pkce: PkceChallenge, loginHint: String = ""): String {
+    val trimmedHint = loginHint.trim()
     val params = linkedMapOf(
       "client_id" to CLIENT_ID,
       "response_type" to "code",
@@ -81,10 +104,13 @@ object MicrosoftOAuthHelper {
       "code_challenge" to pkce.codeChallenge,
       "code_challenge_method" to "S256",
       "state" to pkce.state,
-      "prompt" to "select_account",
+      "prompt" to if (trimmedHint.isNotEmpty()) "login" else "select_account",
     )
-    if (loginHint.isNotBlank()) {
-      params["login_hint"] = loginHint.trim()
+    if (trimmedHint.isNotEmpty()) {
+      params["login_hint"] = trimmedHint
+      if (isConsumerMicrosoftEmail(trimmedHint)) {
+        params["domain_hint"] = "consumers"
+      }
     }
     val queryString = params.entries.joinToString("&") { (k, v) ->
       "${urlEncode(k)}=${urlEncode(v)}"

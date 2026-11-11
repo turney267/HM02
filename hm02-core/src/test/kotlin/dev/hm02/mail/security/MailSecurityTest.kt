@@ -340,6 +340,13 @@ class MailSecurityTest {
     assertTrue(authUrl.contains("code_challenge_method=S256"))
     assertTrue(authUrl.contains("IMAP.AccessAsUser.All"))
     assertTrue(authUrl.contains("SMTP.Send"))
+    assertTrue(authUrl.contains("domain_hint=consumers"))
+    assertTrue(authUrl.contains("prompt=login"))
+
+    val rawWvUa = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/UQ1A; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/131.0.6778.200 Mobile Safari/537.36"
+    val sanitizedUa = MicrosoftOAuthHelper.sanitizeWebViewUserAgent(rawWvUa)
+    assertFalse(sanitizedUa.contains("; wv"))
+    assertFalse(sanitizedUa.contains("Version/4.0"))
     assertTrue(MicrosoftOAuthHelper.isRedirectUri("https://login.microsoftonline.com/common/oauth2/nativeclient?code=123"))
   }
 }
