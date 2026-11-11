@@ -10,6 +10,8 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -2339,56 +2341,168 @@ private fun MicrosoftOAuthSignInSheet(
           settings.userAgentString = MicrosoftOAuthHelper.sanitizeWebViewUserAgent(
             settings.userAgentString.orEmpty(),
           )
+          val webViewCompatShimJs = """
+            (function() {
+              function patchMsConfig(cfg) {
+                if (!cfg || typeof cfg !== 'object') return cfg;
+                try {
+                  cfg.fIsFidoSupported = false;
+                  cfg.fIsPasskeySupportEnabled = false;
+                  cfg.fShowSignInWithFidoOnUsernameView = false;
+                  cfg.fShowProgressForPasskeyAutofill = false;
+                  cfg.fEnableCssAnimation = false;
+                } catch (e) {}
+                return cfg;
+              }
+              try {
+                delete window.PublicKeyCredential;
+                if (window.Window && window.Window.prototype) {
+                  delete window.Window.prototype.PublicKeyCredential;
+                }
+                Object.defineProperty(window, 'PublicKeyCredential', {
+                  value: undefined,
+                  configurable: true,
+                  writable: true
+                });
+              } catch (e) {}
+              try {
+                if (window.navigator && window.navigator.credentials) {
+                  var rejectCreds = function() {
+                    return Promise.reject(new DOMException('Not supported in WebView', 'NotAllowedError'));
+                  };
+                  try {
+                    window.navigator.credentials.get = rejectCreds;
+                    window.navigator.credentials.create = rejectCreds;
+                  } catch (e) {}
+                  if (window.CredentialsContainer && window.CredentialsContainer.prototype) {
+                    try {
+                      window.CredentialsContainer.prototype.get = rejectCreds;
+                      window.CredentialsContainer.prototype.create = rejectCreds;
+                    } catch (e) {}
+                  }
+                }
+              } catch (e) {}
+              try {
+                if (!window.__hm02ConfigTrapped) {
+                  window.__hm02ConfigTrapped = true;
+                  var _serverData = patchMsConfig(window.ServerData);
+                  Object.defineProperty(window, 'ServerData', {
+                    configurable: true,
+                    enumerable: true,
+                    get: function() { return _serverData; },
+                    set: function(v) { _serverData = patchMsConfig(v); }
+                  });
+                  var _msConfig = patchMsConfig(window.${'$'}Config);
+                  Object.defineProperty(window, '${'$'}Config', {
+                    configurable: true,
+                    enumerable: true,
+                    get: function() { return _msConfig; },
+                    set: function(v) { _msConfig = patchMsConfig(v); }
+                  });
+                } else {
+                  patchMsConfig(window.ServerData);
+                  patchMsConfig(window.${'$'}Config);
+                }
+              } catch (e) {
+                patchMsConfig(window.ServerData);
+                patchMsConfig(window.${'$'}Config);
+              }
+              function disableFidoInputs() {
+                try {
+                  if (!document || !document.querySelectorAll) return;
+                  var inputs = document.querySelectorAll('input[name="IsFidoSupported"]');
+                  for (var i = 0; i < inputs.length; i++) {
+                    inputs[i].value = '0';
+                    inputs[i].setAttribute('value', '0');
+                  }
+                } catch (e) {}
+              }
+              function ensureVisibleStyles() {
+                try {
+                  if (!document) return;
+                  var root = document.head || document.documentElement;
+                  if (!root) return;
+                  if (!document.getElementById('hm02-ms-oauth-style')) {
+                    var style = document.createElement('style');
+                    style.id = 'hm02-ms-oauth-style';
+                    style.textContent =
+                      'body { display: block !important; opacity: 1 !important; visibility: visible !important; } ' +
+                      '[data-testid="routeAnimationFluent"], #pageContainer, #outer, #inner, .inner { ' +
+                      'opacity: 1 !important; animation-delay: 0s !important; -webkit-animation-delay: 0s !important; ' +
+                      'animation-duration: 0.01s !important; -webkit-animation-duration: 0.01s !important; }';
+                    root.appendChild(style);
+                  }
+                } catch (e) {}
+              }
+              ensureVisibleStyles();
+              disableFidoInputs();
+              try {
+                if (!window.__hm02AnimGuardInstalled) {
+                  window.__hm02AnimGuardInstalled = true;
+                  document.addEventListener('submit', function() {
+                    disableFidoInputs();
+                  }, true);
+                  if (window.HTMLFormElement && window.HTMLFormElement.prototype) {
+                    var origSubmit = window.HTMLFormElement.prototype.submit;
+                    if (typeof origSubmit === 'function') {
+                      window.HTMLFormElement.prototype.submit = function() {
+                        disableFidoInputs();
+                        return origSubmit.apply(this, arguments);
+                      };
+                    }
+                  }
+                  document.addEventListener('animationstart', function(ev) {
+                    var target = ev.target;
+                    if (!target) return;
+                    setTimeout(function() {
+                      try {
+                        target.dispatchEvent(new AnimationEvent('animationend', {
+                          animationName: ev.animationName,
+                          elapsedTime: 0.3,
+                          bubbles: true
+                        }));
+                      } catch (err) {}
+                    }, 50);
+                  }, true);
+                  setInterval(function() {
+                    try {
+                      ensureVisibleStyles();
+                      patchMsConfig(window.ServerData);
+                      patchMsConfig(window.${'$'}Config);
+                      disableFidoInputs();
+                      if (document && document.querySelectorAll) {
+                        var nodes = document.querySelectorAll('[data-testid="routeAnimationFluent"]');
+                        for (var i = 0; i < nodes.length; i++) {
+                          nodes[i].dispatchEvent(new AnimationEvent('animationend', {
+                            animationName: 'fadeOut',
+                            elapsedTime: 0.3,
+                            bubbles: true
+                          }));
+                        }
+                      }
+                    } catch (err) {}
+                  }, 200);
+                }
+              } catch (e) {}
+            })();
+          """.trimIndent()
+          if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            WebViewCompat.addDocumentStartJavaScript(this, webViewCompatShimJs, setOf("*"))
+          }
           webChromeClient = WebChromeClient()
           webViewClient = object : WebViewClient() {
             private var handledRedirect = false
 
-            private val webViewCompatShimJs = """
-              (function() {
-                try {
-                  delete window.PublicKeyCredential;
-                  if (window.Window && window.Window.prototype) {
-                    delete window.Window.prototype.PublicKeyCredential;
-                  }
-                  Object.defineProperty(window, 'PublicKeyCredential', {
-                    value: undefined,
-                    configurable: true,
-                    writable: true
-                  });
-                } catch (e) {}
-                try {
-                  if (window.ServerData) {
-                    window.ServerData.fIsFidoSupported = false;
-                    window.ServerData.fEnableCssAnimation = false;
-                  }
-                  if (window.${'$'}Config) {
-                    window.${'$'}Config.fIsFidoSupported = false;
-                    window.${'$'}Config.fEnableCssAnimation = false;
-                  }
-                } catch (e) {}
-                try {
-                  if (!window.__hm02AnimGuardInstalled) {
-                    window.__hm02AnimGuardInstalled = true;
-                    document.addEventListener('animationstart', function(ev) {
-                      var target = ev.target;
-                      if (!target) return;
-                      setTimeout(function() {
-                        try {
-                          target.dispatchEvent(new AnimationEvent('animationend', {
-                            animationName: ev.animationName,
-                            elapsedTime: 0.3,
-                            bubbles: true
-                          }));
-                        } catch (err) {}
-                      }, 280);
-                    }, true);
-                  }
-                } catch (e) {}
-              })();
-            """.trimIndent()
-
             private fun injectCompatShim(view: WebView?) {
               view?.evaluateJavascript(webViewCompatShimJs, null)
+            }
+
+            private fun extractOAuthParam(uri: Uri, key: String): String? {
+              uri.getQueryParameter(key)?.takeIf { it.isNotBlank() }?.let { return it }
+              val fragment = uri.fragment?.takeIf { it.isNotBlank() } ?: return null
+              return runCatching {
+                Uri.parse("https://localhost/?$fragment").getQueryParameter(key)
+              }.getOrNull()?.takeIf { it.isNotBlank() }
             }
 
             private fun handlePotentialRedirect(uri: Uri?): Boolean {
@@ -2397,20 +2511,20 @@ private fun MicrosoftOAuthSignInSheet(
               if (!MicrosoftOAuthHelper.isRedirectUri(fullUrl)) return false
               handledRedirect = true
 
-              val returnedState = uri.getQueryParameter("state")
+              val returnedState = extractOAuthParam(uri, "state")
               if (!returnedState.isNullOrBlank() && returnedState != pkce.state) {
                 onAuthError("OAuth state mismatch. Please try signing in again.")
                 return true
               }
 
-              val code = uri.getQueryParameter("code")
+              val code = extractOAuthParam(uri, "code")
               if (!code.isNullOrBlank()) {
                 onAuthCodeReceived(code)
                 return true
               }
 
-              val errDesc = uri.getQueryParameter("error_description")
-                ?: uri.getQueryParameter("error")
+              val errDesc = extractOAuthParam(uri, "error_description")
+                ?: extractOAuthParam(uri, "error")
                 ?: "Microsoft sign-in was cancelled."
               onAuthError(errDesc)
               return true
@@ -2422,6 +2536,10 @@ private fun MicrosoftOAuthSignInSheet(
             ): Boolean {
               val uri = request?.url ?: return false
               if (handlePotentialRedirect(uri)) {
+                return true
+              }
+              val scheme = uri.scheme?.lowercase().orEmpty()
+              if (scheme != "https" && scheme != "http" && scheme != "about") {
                 return true
               }
               return false
@@ -2447,13 +2565,16 @@ private fun MicrosoftOAuthSignInSheet(
 
             override fun onLoadResource(view: WebView?, url: String?) {
               super.onLoadResource(view, url)
-              if (url != null && (url.contains(".js") || url.contains("authorize") || url.contains("GetCredentialType"))) {
+              if (url != null && (url.contains(".js") || url.contains("authorize") || url.contains("GetCredentialType") || url.contains("post.srf"))) {
                 injectCompatShim(view)
               }
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
               super.onPageFinished(view, url)
+              if (url != null && handlePotentialRedirect(Uri.parse(url))) {
+                return
+              }
               injectCompatShim(view)
               isPageLoading = false
             }

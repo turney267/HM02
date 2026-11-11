@@ -68,6 +68,7 @@ dependencies {
   androidTestImplementation(composeBom)
 
   api(libs.androidx.core.ktx)
+  implementation(libs.androidx.webkit)
   api(libs.androidx.lifecycle.runtime.ktx)
   api(libs.androidx.activity.compose)
   api(libs.kotlinx.coroutines.android)
