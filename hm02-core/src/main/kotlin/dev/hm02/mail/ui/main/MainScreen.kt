@@ -4,14 +4,10 @@ import android.Manifest
 import android.content.Intent
 import android.net.Uri
 import android.provider.ContactsContract
-import android.webkit.CookieManager
-import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.webkit.WebViewCompat
-import androidx.webkit.WebViewFeature
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -109,8 +105,6 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.hm02.mail.data.MicrosoftOAuthHelper
-import dev.hm02.mail.data.PkceChallenge
 import dev.hm02.mail.data.parseQuickDaySearchDays
 import dev.hm02.mail.model.ComposeMode
 import dev.hm02.mail.model.ContactSuggestion
@@ -316,10 +310,12 @@ fun HM02AppScreen(
           AccountsManagerPane(
             accounts = uiState.accounts,
             isVerifying = uiState.isVerifyingAccount,
+            isAwaitingMicrosoftOAuth = uiState.isAwaitingMicrosoftOAuth,
             allowCustomServers = uiState.allowCustomServers,
             allowExternalLinks = uiState.allowExternalLinks,
             onSaveAccount = viewModel::verifyAndSaveAccount,
-            onCompleteMicrosoftOAuth = viewModel::completeMicrosoftOAuthSignIn,
+            onStartMicrosoftOAuth = viewModel::startMicrosoftOAuthInBrowser,
+            onCancelMicrosoftOAuth = viewModel::cancelMicrosoftOAuthSignIn,
             onRemoveAccount = viewModel::removeAccount,
             onBack = viewModel::showFeed,
           )
@@ -1871,16 +1867,17 @@ private fun SettingsPane(
 private fun AccountsManagerPane(
   accounts: List<EmailAccount>,
   isVerifying: Boolean,
+  isAwaitingMicrosoftOAuth: Boolean,
   allowCustomServers: Boolean,
   allowExternalLinks: Boolean,
   onSaveAccount: (EmailAccount, Boolean, () -> Unit) -> Unit,
-  onCompleteMicrosoftOAuth: (
-    authorizationCode: String,
-    codeVerifier: String,
-    fallbackEmail: String,
-    fallbackDisplayName: String,
+  onStartMicrosoftOAuth: (
+    emailAddress: String,
+    displayName: String,
+    openBrowserUrl: (String) -> Boolean,
     onSuccess: () -> Unit,
   ) -> Unit,
+  onCancelMicrosoftOAuth: () -> Unit,
   onRemoveAccount: (String) -> Unit,
   onBack: () -> Unit,
 ) {
@@ -1898,8 +1895,6 @@ private fun AccountsManagerPane(
   var imapPort by rememberSaveable { mutableStateOf(MailProviderPreset.GMAIL.imapPort.toString()) }
   var smtpHost by rememberSaveable { mutableStateOf(MailProviderPreset.GMAIL.smtpHost) }
   var smtpPort by rememberSaveable { mutableStateOf(MailProviderPreset.GMAIL.smtpPort.toString()) }
-  var activeMicrosoftPkce by remember { mutableStateOf<PkceChallenge?>(null) }
-  var oauthErrorBanner by remember { mutableStateOf<String?>(null) }
 
   val availablePresets = remember(allowCustomServers) {
     if (allowCustomServers) {
@@ -1922,36 +1917,6 @@ private fun AccountsManagerPane(
       smtpHost = selectedPreset.smtpHost
       smtpPort = selectedPreset.smtpPort.toString()
     }
-  }
-
-  val activePkce = activeMicrosoftPkce
-  if (activePkce != null) {
-    MicrosoftOAuthSignInSheet(
-      pkce = activePkce,
-      loginHint = emailAddress.trim(),
-      onDismiss = { activeMicrosoftPkce = null },
-      onAuthCodeReceived = { code ->
-        val verifier = activePkce.codeVerifier
-        activeMicrosoftPkce = null
-        oauthErrorBanner = null
-        onCompleteMicrosoftOAuth(
-          code,
-          verifier,
-          emailAddress.trim(),
-          displayName.trim(),
-        ) {
-          appPassword = ""
-          emailAddress = ""
-          displayName = ""
-          isAddingAccount = false
-        }
-      },
-      onAuthError = { errMsg ->
-        activeMicrosoftPkce = null
-        oauthErrorBanner = errMsg
-      },
-    )
-    return
   }
 
   Column(
@@ -2127,30 +2092,64 @@ private fun AccountsManagerPane(
           label = "Email: ",
           value = emailAddress,
           onValueChange = { emailAddress = it },
-          placeholder = if (selectedPreset == MailProviderPreset.OUTLOOK) "you@outlook.com (optional)" else "you@example.com",
+          placeholder = if (selectedPreset == MailProviderPreset.OUTLOOK) "you@outlook.com" else "you@example.com",
           keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
         )
         HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
         if (selectedPreset.authType == MailAuthType.OAUTH2_MICROSOFT) {
-          if (!oauthErrorBanner.isNullOrBlank()) {
+          if (isAwaitingMicrosoftOAuth && !isVerifying) {
             Spacer(modifier = Modifier.height(10.dp))
             Text(
-              text = oauthErrorBanner.orEmpty(),
+              text = "Complete Microsoft sign-in in Surf, then return to Fly.",
               style = MaterialTheme.typography.bodySmall,
-              color = surfColors.alertRed,
+              color = surfColors.progressBlue,
             )
           }
           Spacer(modifier = Modifier.height(16.dp))
-          SurfPillButton(
-            label = if (isVerifying) "Signing in..." else "Sign in with Microsoft",
-            isPrimary = true,
-            enabled = !isVerifying,
-            onClick = {
-              oauthErrorBanner = null
-              activeMicrosoftPkce = MicrosoftOAuthHelper.generatePkceChallenge()
-            },
-          )
+          Row(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            SurfPillButton(
+              label = when {
+                isVerifying -> "Signing in..."
+                isAwaitingMicrosoftOAuth -> "Reopen in Surf"
+                else -> "Sign in with Microsoft"
+              },
+              isPrimary = true,
+              enabled = !isVerifying && emailAddress.isNotBlank(),
+              onClick = {
+                onStartMicrosoftOAuth(
+                  emailAddress.trim(),
+                  displayName.trim(),
+                  { authorizeUrl ->
+                    runCatching {
+                      val intent = Intent(Intent.ACTION_VIEW, Uri.parse(authorizeUrl)).apply {
+                        addCategory(Intent.CATEGORY_BROWSABLE)
+                        component = null
+                        selector = null
+                      }
+                      context.startActivity(intent)
+                      true
+                    }.getOrDefault(false)
+                  },
+                ) {
+                  appPassword = ""
+                  emailAddress = ""
+                  displayName = ""
+                  isAddingAccount = false
+                }
+              },
+            )
+            if (isAwaitingMicrosoftOAuth && !isVerifying) {
+              SurfPillButton(
+                label = "Cancel",
+                isPrimary = false,
+                onClick = onCancelMicrosoftOAuth,
+              )
+            }
+          }
           Spacer(modifier = Modifier.height(24.dp))
         } else {
           BlankPageFieldRow(
@@ -2244,348 +2243,6 @@ private fun AccountsManagerPane(
         }
       }
     }
-  }
-}
-
-@Composable
-private fun MicrosoftOAuthSignInSheet(
-  pkce: PkceChallenge,
-  loginHint: String,
-  onDismiss: () -> Unit,
-  onAuthCodeReceived: (String) -> Unit,
-  onAuthError: (String) -> Unit,
-) {
-  val surfColors = LocalSurfColors.current
-  val authorizeUrl = remember(pkce, loginHint) {
-    MicrosoftOAuthHelper.buildAuthorizationUrl(pkce = pkce, loginHint = loginHint)
-  }
-  var isPageLoading by remember { mutableStateOf(true) }
-  var webViewRef by remember { mutableStateOf<WebView?>(null) }
-
-  BackHandler {
-    onDismiss()
-  }
-
-  DisposableEffect(Unit) {
-    onDispose {
-      webViewRef?.apply {
-        stopLoading()
-        loadUrl("about:blank")
-        destroy()
-      }
-      webViewRef = null
-    }
-  }
-
-  Column(
-    modifier = Modifier
-      .fillMaxSize()
-      .background(surfColors.cardBg),
-  ) {
-    Row(
-      modifier = Modifier
-        .fillMaxWidth()
-        .background(surfColors.headerBg)
-        .padding(horizontal = 10.dp, vertical = 6.dp),
-      horizontalArrangement = Arrangement.SpaceBetween,
-      verticalAlignment = Alignment.CenterVertically,
-    ) {
-      TextButton(onClick = onDismiss) {
-        Text(
-          text = "< Cancel",
-          fontFamily = FontFamily.Monospace,
-          fontWeight = FontWeight.Bold,
-          fontSize = 13.sp,
-          color = surfColors.primaryText,
-        )
-      }
-      Text(
-        text = "MICROSOFT SIGN IN",
-        fontFamily = FontFamily.Monospace,
-        fontWeight = FontWeight.Bold,
-        fontSize = 13.sp,
-        color = surfColors.primaryText,
-        modifier = Modifier.padding(end = 8.dp),
-      )
-    }
-
-    if (isPageLoading) {
-      LinearProgressIndicator(
-        modifier = Modifier
-          .fillMaxWidth()
-          .height(3.dp),
-        color = surfColors.progressBlue,
-        trackColor = surfColors.progressTrack,
-      )
-    } else {
-      HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
-    }
-
-    AndroidView(
-      modifier = Modifier.fillMaxSize(),
-      factory = { ctx ->
-        WebView(ctx).apply {
-          webViewRef = this
-          setBackgroundColor(android.graphics.Color.WHITE)
-          val cookieManager = CookieManager.getInstance()
-          cookieManager.setAcceptCookie(true)
-          cookieManager.setAcceptThirdPartyCookies(this, true)
-
-          settings.javaScriptEnabled = true
-          settings.domStorageEnabled = true
-          settings.javaScriptCanOpenWindowsAutomatically = true
-          settings.loadWithOverviewMode = true
-          settings.useWideViewPort = true
-          settings.allowFileAccess = false
-          settings.allowContentAccess = false
-          settings.userAgentString = MicrosoftOAuthHelper.sanitizeWebViewUserAgent(
-            settings.userAgentString.orEmpty(),
-          )
-          val webViewCompatShimJs = """
-            (function() {
-              function patchMsConfig(cfg) {
-                if (!cfg || typeof cfg !== 'object') return cfg;
-                try {
-                  cfg.fIsFidoSupported = false;
-                  cfg.fIsPasskeySupportEnabled = false;
-                  cfg.fShowSignInWithFidoOnUsernameView = false;
-                  cfg.fShowProgressForPasskeyAutofill = false;
-                  cfg.fEnableCssAnimation = false;
-                } catch (e) {}
-                return cfg;
-              }
-              try {
-                delete window.PublicKeyCredential;
-                if (window.Window && window.Window.prototype) {
-                  delete window.Window.prototype.PublicKeyCredential;
-                }
-                Object.defineProperty(window, 'PublicKeyCredential', {
-                  value: undefined,
-                  configurable: true,
-                  writable: true
-                });
-              } catch (e) {}
-              try {
-                if (window.navigator && window.navigator.credentials) {
-                  var rejectCreds = function() {
-                    return Promise.reject(new DOMException('Not supported in WebView', 'NotAllowedError'));
-                  };
-                  try {
-                    window.navigator.credentials.get = rejectCreds;
-                    window.navigator.credentials.create = rejectCreds;
-                  } catch (e) {}
-                  if (window.CredentialsContainer && window.CredentialsContainer.prototype) {
-                    try {
-                      window.CredentialsContainer.prototype.get = rejectCreds;
-                      window.CredentialsContainer.prototype.create = rejectCreds;
-                    } catch (e) {}
-                  }
-                }
-              } catch (e) {}
-              try {
-                if (!window.__hm02ConfigTrapped) {
-                  window.__hm02ConfigTrapped = true;
-                  var _serverData = patchMsConfig(window.ServerData);
-                  Object.defineProperty(window, 'ServerData', {
-                    configurable: true,
-                    enumerable: true,
-                    get: function() { return _serverData; },
-                    set: function(v) { _serverData = patchMsConfig(v); }
-                  });
-                  var _msConfig = patchMsConfig(window.${'$'}Config);
-                  Object.defineProperty(window, '${'$'}Config', {
-                    configurable: true,
-                    enumerable: true,
-                    get: function() { return _msConfig; },
-                    set: function(v) { _msConfig = patchMsConfig(v); }
-                  });
-                } else {
-                  patchMsConfig(window.ServerData);
-                  patchMsConfig(window.${'$'}Config);
-                }
-              } catch (e) {
-                patchMsConfig(window.ServerData);
-                patchMsConfig(window.${'$'}Config);
-              }
-              function disableFidoInputs() {
-                try {
-                  if (!document || !document.querySelectorAll) return;
-                  var inputs = document.querySelectorAll('input[name="IsFidoSupported"]');
-                  for (var i = 0; i < inputs.length; i++) {
-                    inputs[i].value = '0';
-                    inputs[i].setAttribute('value', '0');
-                  }
-                } catch (e) {}
-              }
-              function ensureVisibleStyles() {
-                try {
-                  if (!document) return;
-                  var root = document.head || document.documentElement;
-                  if (!root) return;
-                  if (!document.getElementById('hm02-ms-oauth-style')) {
-                    var style = document.createElement('style');
-                    style.id = 'hm02-ms-oauth-style';
-                    style.textContent =
-                      'body { display: block !important; opacity: 1 !important; visibility: visible !important; } ' +
-                      '[data-testid="routeAnimationFluent"], #pageContainer, #outer, #inner, .inner { ' +
-                      'opacity: 1 !important; animation-delay: 0s !important; -webkit-animation-delay: 0s !important; ' +
-                      'animation-duration: 0.01s !important; -webkit-animation-duration: 0.01s !important; }';
-                    root.appendChild(style);
-                  }
-                } catch (e) {}
-              }
-              ensureVisibleStyles();
-              disableFidoInputs();
-              try {
-                if (!window.__hm02AnimGuardInstalled) {
-                  window.__hm02AnimGuardInstalled = true;
-                  document.addEventListener('submit', function() {
-                    disableFidoInputs();
-                  }, true);
-                  if (window.HTMLFormElement && window.HTMLFormElement.prototype) {
-                    var origSubmit = window.HTMLFormElement.prototype.submit;
-                    if (typeof origSubmit === 'function') {
-                      window.HTMLFormElement.prototype.submit = function() {
-                        disableFidoInputs();
-                        return origSubmit.apply(this, arguments);
-                      };
-                    }
-                  }
-                  document.addEventListener('animationstart', function(ev) {
-                    var target = ev.target;
-                    if (!target) return;
-                    setTimeout(function() {
-                      try {
-                        target.dispatchEvent(new AnimationEvent('animationend', {
-                          animationName: ev.animationName,
-                          elapsedTime: 0.3,
-                          bubbles: true
-                        }));
-                      } catch (err) {}
-                    }, 50);
-                  }, true);
-                  setInterval(function() {
-                    try {
-                      ensureVisibleStyles();
-                      patchMsConfig(window.ServerData);
-                      patchMsConfig(window.${'$'}Config);
-                      disableFidoInputs();
-                      if (document && document.querySelectorAll) {
-                        var nodes = document.querySelectorAll('[data-testid="routeAnimationFluent"]');
-                        for (var i = 0; i < nodes.length; i++) {
-                          nodes[i].dispatchEvent(new AnimationEvent('animationend', {
-                            animationName: 'fadeOut',
-                            elapsedTime: 0.3,
-                            bubbles: true
-                          }));
-                        }
-                      }
-                    } catch (err) {}
-                  }, 200);
-                }
-              } catch (e) {}
-            })();
-          """.trimIndent()
-          if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            WebViewCompat.addDocumentStartJavaScript(this, webViewCompatShimJs, setOf("*"))
-          }
-          webChromeClient = WebChromeClient()
-          webViewClient = object : WebViewClient() {
-            private var handledRedirect = false
-
-            private fun injectCompatShim(view: WebView?) {
-              view?.evaluateJavascript(webViewCompatShimJs, null)
-            }
-
-            private fun extractOAuthParam(uri: Uri, key: String): String? {
-              uri.getQueryParameter(key)?.takeIf { it.isNotBlank() }?.let { return it }
-              val fragment = uri.fragment?.takeIf { it.isNotBlank() } ?: return null
-              return runCatching {
-                Uri.parse("https://localhost/?$fragment").getQueryParameter(key)
-              }.getOrNull()?.takeIf { it.isNotBlank() }
-            }
-
-            private fun handlePotentialRedirect(uri: Uri?): Boolean {
-              if (handledRedirect || uri == null) return false
-              val fullUrl = uri.toString()
-              if (!MicrosoftOAuthHelper.isRedirectUri(fullUrl)) return false
-              handledRedirect = true
-
-              val returnedState = extractOAuthParam(uri, "state")
-              if (!returnedState.isNullOrBlank() && returnedState != pkce.state) {
-                onAuthError("OAuth state mismatch. Please try signing in again.")
-                return true
-              }
-
-              val code = extractOAuthParam(uri, "code")
-              if (!code.isNullOrBlank()) {
-                onAuthCodeReceived(code)
-                return true
-              }
-
-              val errDesc = extractOAuthParam(uri, "error_description")
-                ?: extractOAuthParam(uri, "error")
-                ?: "Microsoft sign-in was cancelled."
-              onAuthError(errDesc)
-              return true
-            }
-
-            override fun shouldOverrideUrlLoading(
-              view: WebView?,
-              request: WebResourceRequest?,
-            ): Boolean {
-              val uri = request?.url ?: return false
-              if (handlePotentialRedirect(uri)) {
-                return true
-              }
-              val scheme = uri.scheme?.lowercase().orEmpty()
-              if (scheme != "https" && scheme != "http" && scheme != "about") {
-                return true
-              }
-              return false
-            }
-
-            override fun onPageStarted(
-              view: WebView?,
-              url: String?,
-              favicon: android.graphics.Bitmap?,
-            ) {
-              super.onPageStarted(view, url, favicon)
-              isPageLoading = true
-              if (url != null && handlePotentialRedirect(Uri.parse(url))) {
-                return
-              }
-              injectCompatShim(view)
-            }
-
-            override fun onPageCommitVisible(view: WebView?, url: String?) {
-              super.onPageCommitVisible(view, url)
-              injectCompatShim(view)
-            }
-
-            override fun onLoadResource(view: WebView?, url: String?) {
-              super.onLoadResource(view, url)
-              if (url != null && (url.contains(".js") || url.contains("authorize") || url.contains("GetCredentialType") || url.contains("post.srf"))) {
-                injectCompatShim(view)
-              }
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-              super.onPageFinished(view, url)
-              if (url != null && handlePotentialRedirect(Uri.parse(url))) {
-                return
-              }
-              injectCompatShim(view)
-              isPageLoading = false
-            }
-          }
-          loadUrl(authorizeUrl)
-        }
-      },
-      update = { webView ->
-        webViewRef = webView
-      },
-    )
   }
 }
 

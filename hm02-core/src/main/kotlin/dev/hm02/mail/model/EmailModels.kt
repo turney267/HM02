@@ -37,7 +37,7 @@ enum class MailProviderPreset(
     smtpHost = "smtp.office365.com",
     smtpPort = 587,
     appPasswordUrl = null,
-    setupHint = "Microsoft requires OAuth2 Modern Authentication for Outlook, Hotmail, Live, and Microsoft 365 accounts. Tap Sign in with Microsoft below.",
+    setupHint = "Enter your Outlook, Hotmail, Live, or Microsoft 365 email address below, then tap Sign in with Microsoft to authenticate in Surf.",
     authType = MailAuthType.OAUTH2_MICROSOFT,
   ),
   ICLOUD(

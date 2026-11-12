@@ -348,5 +348,31 @@ class MailSecurityTest {
     assertFalse(sanitizedUa.contains("; wv"))
     assertFalse(sanitizedUa.contains("Version/4.0"))
     assertTrue(MicrosoftOAuthHelper.isRedirectUri("https://login.microsoftonline.com/common/oauth2/nativeclient?code=123"))
+    assertTrue(MicrosoftOAuthHelper.isRedirectUri("http://localhost:54321/?code=123"))
+
+    var receivedCode: Result<String>? = null
+    val latch = java.util.concurrent.CountDownLatch(1)
+    val loopbackServer = dev.hm02.mail.data.MicrosoftLoopbackOAuthServer(expectedState = pkce.state) { result ->
+      receivedCode = result
+      latch.countDown()
+    }
+    try {
+      val loopbackAuthUrl = MicrosoftOAuthHelper.buildAuthorizationUrl(
+        pkce = pkce,
+        loginHint = "user@outlook.com",
+        redirectUri = loopbackServer.redirectUri,
+      )
+      assertTrue(loopbackAuthUrl.contains(java.net.URLEncoder.encode(loopbackServer.redirectUri, "UTF-8")))
+
+      val callbackConn = java.net.URL("${loopbackServer.redirectUri}?code=test-auth-code-999&state=${pkce.state}")
+        .openConnection() as java.net.HttpURLConnection
+      assertEquals(200, callbackConn.responseCode)
+      val htmlBody = callbackConn.inputStream.bufferedReader().use { it.readText() }
+      assertTrue(htmlBody.contains(MicrosoftOAuthHelper.APP_RETURN_URI))
+      assertTrue(latch.await(5, java.util.concurrent.TimeUnit.SECONDS))
+      assertEquals("test-auth-code-999", receivedCode?.getOrNull())
+    } finally {
+      loopbackServer.close()
+    }
   }
 }

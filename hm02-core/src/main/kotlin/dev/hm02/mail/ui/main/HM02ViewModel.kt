@@ -8,6 +8,7 @@ import dev.hm02.mail.data.AccountStore
 import dev.hm02.mail.data.AccountSyncError
 import dev.hm02.mail.data.ImapSmtpMailClient
 import dev.hm02.mail.data.MailClient
+import dev.hm02.mail.data.MicrosoftLoopbackOAuthServer
 import dev.hm02.mail.data.MicrosoftOAuthHelper
 import dev.hm02.mail.data.SettingsAndContactsStore
 import dev.hm02.mail.model.ComposeMode
@@ -140,6 +141,7 @@ data class HM02UiState(
   val isSearching: Boolean = false,
   val isSendingEmail: Boolean = false,
   val isVerifyingAccount: Boolean = false,
+  val isAwaitingMicrosoftOAuth: Boolean = false,
   val lastRefreshedAtMillis: Long? = null,
   val statusMessage: String? = null,
   val activePane: ActivePane = ActivePane.Feed,
@@ -156,6 +158,9 @@ class HM02ViewModel(
 
   @Volatile
   private var policyConfig: MailPolicyConfig = initialPolicyConfig
+
+  @Volatile
+  private var activeLoopbackServer: MicrosoftLoopbackOAuthServer? = null
 
   private var latestSyncedFeedItems: List<EmailSummary> = emptyList()
 
@@ -849,9 +854,109 @@ class HM02ViewModel(
     }
   }
 
+  fun startMicrosoftOAuthInBrowser(
+    email: String,
+    displayName: String,
+    openBrowserUrl: (String) -> Boolean,
+    onSuccess: () -> Unit = {},
+  ) {
+    activeLoopbackServer?.close()
+    activeLoopbackServer = null
+
+    val pkce = MicrosoftOAuthHelper.generatePkceChallenge()
+    val server = try {
+      MicrosoftLoopbackOAuthServer(
+        expectedState = pkce.state,
+        brandTitle = policyConfig.brandTitle,
+        onResult = { result ->
+          activeLoopbackServer = null
+          result.fold(
+            onSuccess = { code ->
+              val redirectUri = activeLoopbackRedirectUri ?: MicrosoftOAuthHelper.REDIRECT_URI
+              completeMicrosoftOAuthSignIn(
+                authorizationCode = code,
+                codeVerifier = pkce.codeVerifier,
+                redirectUri = redirectUri,
+                fallbackEmail = email.trim(),
+                fallbackDisplayName = displayName.trim(),
+                onSuccess = onSuccess,
+              )
+            },
+            onFailure = { err ->
+              _uiState.update {
+                it.copy(
+                  isAwaitingMicrosoftOAuth = false,
+                  isVerifyingAccount = false,
+                  statusMessage = err.localizedMessage ?: "Microsoft sign-in was cancelled.",
+                )
+              }
+            },
+          )
+        },
+      )
+    } catch (e: Exception) {
+      _uiState.update {
+        it.copy(
+          isAwaitingMicrosoftOAuth = false,
+          statusMessage = "Failed to start local OAuth listener: ${e.localizedMessage ?: "Unknown error"}",
+        )
+      }
+      return
+    }
+
+    activeLoopbackServer = server
+    activeLoopbackRedirectUri = server.redirectUri
+
+    val authorizeUrl = MicrosoftOAuthHelper.buildAuthorizationUrl(
+      pkce = pkce,
+      loginHint = email.trim(),
+      redirectUri = server.redirectUri,
+    )
+
+    _uiState.update {
+      it.copy(
+        isAwaitingMicrosoftOAuth = true,
+        statusMessage = null,
+      )
+    }
+
+    if (!openBrowserUrl(authorizeUrl)) {
+      server.close()
+      activeLoopbackServer = null
+      _uiState.update {
+        it.copy(
+          isAwaitingMicrosoftOAuth = false,
+          statusMessage = "Could not open Surf browser for Microsoft sign-in.",
+        )
+      }
+    }
+  }
+
+  @Volatile
+  private var activeLoopbackRedirectUri: String? = null
+
+  fun cancelMicrosoftOAuthSignIn() {
+    activeLoopbackServer?.close()
+    activeLoopbackServer = null
+    activeLoopbackRedirectUri = null
+    _uiState.update {
+      it.copy(
+        isAwaitingMicrosoftOAuth = false,
+        statusMessage = "Microsoft sign-in cancelled.",
+      )
+    }
+  }
+
+  override fun onCleared() {
+    activeLoopbackServer?.close()
+    activeLoopbackServer = null
+    super.onCleared()
+  }
+
   fun completeMicrosoftOAuthSignIn(
     authorizationCode: String,
     codeVerifier: String,
+    redirectUri: String = MicrosoftOAuthHelper.REDIRECT_URI,
     fallbackEmail: String,
     fallbackDisplayName: String,
     onSuccess: () -> Unit = {},
@@ -859,6 +964,7 @@ class HM02ViewModel(
     viewModelScope.launch {
       _uiState.update {
         it.copy(
+          isAwaitingMicrosoftOAuth = false,
           isVerifyingAccount = true,
           statusMessage = "Completing Microsoft sign-in...",
         )
@@ -866,6 +972,7 @@ class HM02ViewModel(
       val tokenResult = MicrosoftOAuthHelper.exchangeAuthorizationCode(
         code = authorizationCode,
         codeVerifier = codeVerifier,
+        redirectUri = redirectUri,
       )
       if (tokenResult.isFailure) {
         val reason = tokenResult.exceptionOrNull()?.localizedMessage ?: "Failed to exchange Microsoft OAuth code"
