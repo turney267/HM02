@@ -148,6 +148,7 @@ object MicrosoftOAuthHelper {
         "code" to code,
         "redirect_uri" to redirectUri,
         "code_verifier" to codeVerifier,
+        "scope" to SCOPES,
       )
       postTokenRequestWithRetry(formFields, fallbackRefreshToken = null)
     }
@@ -161,6 +162,7 @@ object MicrosoftOAuthHelper {
         "client_id" to CLIENT_ID,
         "grant_type" to "refresh_token",
         "refresh_token" to refreshToken,
+        "scope" to SCOPES,
       )
       postTokenRequestWithRetry(formFields, fallbackRefreshToken = refreshToken)
     }

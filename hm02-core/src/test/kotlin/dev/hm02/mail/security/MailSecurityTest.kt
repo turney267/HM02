@@ -322,15 +322,14 @@ class MailSecurityTest {
     assertTrue(oauthAccount.isOAuth2)
     val imapProps = buildImapProperties(oauthAccount)
     assertEquals("XOAUTH2", imapProps.getProperty("mail.imaps.auth.mechanisms"))
-    assertEquals("true", imapProps.getProperty("mail.imaps.sasl.enable"))
-    assertEquals("XOAUTH2", imapProps.getProperty("mail.imaps.sasl.mechanisms"))
+    assertNull(imapProps.getProperty("mail.imaps.sasl.enable"))
     assertEquals("true", imapProps.getProperty("mail.imaps.auth.login.disable"))
     assertEquals("true", imapProps.getProperty("mail.imaps.auth.plain.disable"))
 
     val smtpProps = buildSmtpProperties(oauthAccount)
     assertEquals("XOAUTH2", smtpProps.getProperty("mail.smtp.auth.mechanisms"))
-    assertEquals("true", smtpProps.getProperty("mail.smtp.sasl.enable"))
-    assertEquals("XOAUTH2", smtpProps.getProperty("mail.smtp.sasl.mechanisms"))
+    assertEquals("XOAUTH2", smtpProps.getProperty("mail.smtps.auth.mechanisms"))
+    assertNull(smtpProps.getProperty("mail.smtp.sasl.enable"))
 
     val pkce = MicrosoftOAuthHelper.generatePkceChallenge()
     assertTrue(pkce.codeVerifier.length >= 43)

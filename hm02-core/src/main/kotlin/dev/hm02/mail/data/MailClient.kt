@@ -252,9 +252,12 @@ internal fun buildImapProperties(account: EmailAccount): Properties {
     put("mail.imaps.timeout", TIMEOUT_MILLIS)
     put("mail.imaps.writetimeout", TIMEOUT_MILLIS)
     if (account.isOAuth2) {
+      // IMPORTANT: Do NOT set mail.imaps.sasl.enable = "true" on Android!
+      // android-mail-1.6.7 omits com.sun.mail.imap.protocol.IMAPSaslAuthenticator
+      // (because Android lacks javax.security.sasl), which causes IMAPStore.login()
+      // to throw CommandFailedException("SASL authentication failed") before reaching
+      // JavaMail's built-in IMAPProtocol.authxoauth2() implementation.
       put("mail.imaps.auth.mechanisms", "XOAUTH2")
-      put("mail.imaps.sasl.enable", "true")
-      put("mail.imaps.sasl.mechanisms", "XOAUTH2")
       put("mail.imaps.auth.login.disable", "true")
       put("mail.imaps.auth.plain.disable", "true")
     }
@@ -284,10 +287,12 @@ internal fun buildSmtpProperties(account: EmailAccount): Properties {
       put("mail.smtp.starttls.required", "true")
     }
     if (account.isOAuth2) {
+      // IMPORTANT: Do NOT set mail.smtp.sasl.enable = "true" on Android!
+      // android-mail-1.6.7 omits com.sun.mail.smtp.SMTPSaslAuthenticator, causing
+      // SMTPTransport.authenticate() to return false ("SASL authentication failed")
+      // before reaching SMTPTransport$OAuth2Authenticator.
       put("mail.smtp.auth.mechanisms", "XOAUTH2")
       put("mail.smtps.auth.mechanisms", "XOAUTH2")
-      put("mail.smtp.sasl.enable", "true")
-      put("mail.smtp.sasl.mechanisms", "XOAUTH2")
       put("mail.smtp.auth.login.disable", "true")
       put("mail.smtp.auth.plain.disable", "true")
     }
