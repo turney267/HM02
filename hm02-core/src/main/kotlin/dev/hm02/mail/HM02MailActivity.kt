@@ -42,6 +42,7 @@ open class HM02MailActivity : ComponentActivity() {
       ),
     )[HM02ViewModel::class.java]
     hm02ViewModel.updatePolicyConfig(initialPolicyConfig)
+    hm02ViewModel.handleOAuthCallbackUri(intent?.dataString)
 
     enableEdgeToEdge()
     setContent {
@@ -60,6 +61,9 @@ open class HM02MailActivity : ComponentActivity() {
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     setIntent(intent)
+    if (::hm02ViewModel.isInitialized) {
+      hm02ViewModel.handleOAuthCallbackUri(intent.dataString)
+    }
   }
 
   override fun onResume() {

@@ -51,12 +51,9 @@ object MicrosoftOAuthHelper {
   private const val TOKEN_ENDPOINT = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 
   internal val SCOPES = listOf(
-    "openid",
-    "profile",
-    "email",
-    "offline_access",
     "https://outlook.office.com/IMAP.AccessAsUser.All",
     "https://outlook.office.com/SMTP.Send",
+    "offline_access",
   ).joinToString(" ")
 
   private val json = Json { ignoreUnknownKeys = true }
@@ -151,9 +148,8 @@ object MicrosoftOAuthHelper {
         "code" to code,
         "redirect_uri" to redirectUri,
         "code_verifier" to codeVerifier,
-        "scope" to SCOPES,
       )
-      postTokenRequest(formFields, fallbackRefreshToken = null)
+      postTokenRequestWithRetry(formFields, fallbackRefreshToken = null)
     }
   }
 
@@ -165,10 +161,27 @@ object MicrosoftOAuthHelper {
         "client_id" to CLIENT_ID,
         "grant_type" to "refresh_token",
         "refresh_token" to refreshToken,
-        "scope" to SCOPES,
       )
-      postTokenRequest(formFields, fallbackRefreshToken = refreshToken)
+      postTokenRequestWithRetry(formFields, fallbackRefreshToken = refreshToken)
     }
+  }
+
+  private fun postTokenRequestWithRetry(
+    formFields: Map<String, String>,
+    fallbackRefreshToken: String?,
+  ): MicrosoftOAuthTokenResult {
+    var lastError: Throwable? = null
+    for (attempt in 1..3) {
+      try {
+        return postTokenRequest(formFields, fallbackRefreshToken)
+      } catch (e: java.io.IOException) {
+        lastError = e
+        if (attempt < 3) {
+          runCatching { Thread.sleep(600L * attempt) }
+        }
+      }
+    }
+    throw lastError ?: IllegalStateException("Microsoft OAuth2 network request failed")
   }
 
   private fun postTokenRequest(
@@ -365,10 +378,14 @@ class MicrosoftLoopbackOAuthServer(
         }
 
         if (expectedState.isNotBlank() && returnedState != expectedState) {
+          val returnLink = buildReturnUriWithParams(
+            mapOf("error" to "invalid_state", "error_description" to "OAuth state mismatch. Please try signing in again."),
+          )
           val html = buildCallbackHtml(
             title = "Sign-In Error",
             subtitle = "OAuth state mismatch. Please return to $brandTitle and try again.",
             isSuccess = false,
+            returnUri = returnLink,
           )
           writeHttpResponse(client, "200 OK", "text/html; charset=utf-8", html)
           deliverOnce(Result.failure(IllegalStateException("OAuth state mismatch. Please try signing in again.")))
@@ -377,20 +394,28 @@ class MicrosoftLoopbackOAuthServer(
         }
 
         if (code.isNotEmpty()) {
+          val returnLink = buildReturnUriWithParams(
+            mapOf("code" to code, "state" to returnedState),
+          )
           val html = buildCallbackHtml(
             title = "Sign-In Complete",
             subtitle = "Completing Outlook setup in $brandTitle\u2026",
             isSuccess = true,
+            returnUri = returnLink,
           )
           writeHttpResponse(client, "200 OK", "text/html; charset=utf-8", html)
           deliverOnce(Result.success(code))
           close()
         } else {
           val msg = errorDesc.ifBlank { error.ifBlank { "Microsoft sign-in was cancelled." } }
+          val returnLink = buildReturnUriWithParams(
+            mapOf("error" to error.ifBlank { "cancelled" }, "error_description" to msg),
+          )
           val html = buildCallbackHtml(
             title = "Sign-In Cancelled",
             subtitle = msg,
             isSuccess = false,
+            returnUri = returnLink,
           )
           writeHttpResponse(client, "200 OK", "text/html; charset=utf-8", html)
           deliverOnce(Result.failure(IllegalStateException(msg)))
@@ -421,13 +446,29 @@ class MicrosoftLoopbackOAuthServer(
     }
   }
 
+  private fun buildReturnUriWithParams(params: Map<String, String>): String {
+    val nonEmpty = params.filterValues { it.isNotBlank() }
+    if (nonEmpty.isEmpty()) return appReturnUri
+    val query = nonEmpty.entries.joinToString("&") { (k, v) ->
+      "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
+    }
+    return "$appReturnUri?$query"
+  }
+
   private fun buildCallbackHtml(
     title: String,
     subtitle: String,
     isSuccess: Boolean,
+    returnUri: String = appReturnUri,
   ): String {
     val safeTitle = escapeHtml(title)
     val safeSubtitle = escapeHtml(subtitle)
+    val safeReturnAttr = escapeHtml(returnUri)
+    val safeReturnJs = returnUri
+      .replace("\\", "\\\\")
+      .replace("\"", "\\\"")
+      .replace("\r", "")
+      .replace("\n", "")
     val badgeColor = if (isSuccess) "#16A34A" else "#DC2626"
     return """
       <!DOCTYPE html>
@@ -492,12 +533,12 @@ class MicrosoftLoopbackOAuthServer(
           <div class="dot"></div>
           <h1>$safeTitle</h1>
           <p>$safeSubtitle</p>
-          <a class="btn" href="$appReturnUri">Return to ${escapeHtml(brandTitle)}</a>
+          <a class="btn" href="$safeReturnAttr">Return to ${escapeHtml(brandTitle)}</a>
         </div>
         <script>
           setTimeout(function() {
             try {
-              window.location.replace("$appReturnUri");
+              window.location.replace("$safeReturnJs");
             } catch (e) {}
           }, 120);
         </script>

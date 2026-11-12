@@ -311,6 +311,7 @@ fun HM02AppScreen(
             accounts = uiState.accounts,
             isVerifying = uiState.isVerifyingAccount,
             isAwaitingMicrosoftOAuth = uiState.isAwaitingMicrosoftOAuth,
+            accountSetupError = uiState.accountSetupError,
             allowCustomServers = uiState.allowCustomServers,
             allowExternalLinks = uiState.allowExternalLinks,
             onSaveAccount = viewModel::verifyAndSaveAccount,
@@ -1868,6 +1869,7 @@ private fun AccountsManagerPane(
   accounts: List<EmailAccount>,
   isVerifying: Boolean,
   isAwaitingMicrosoftOAuth: Boolean,
+  accountSetupError: String?,
   allowCustomServers: Boolean,
   allowExternalLinks: Boolean,
   onSaveAccount: (EmailAccount, Boolean, () -> Unit) -> Unit,
@@ -2098,12 +2100,35 @@ private fun AccountsManagerPane(
         HorizontalDivider(thickness = 1.dp, color = surfColors.cardStroke)
 
         if (selectedPreset.authType == MailAuthType.OAUTH2_MICROSOFT) {
-          if (isAwaitingMicrosoftOAuth && !isVerifying) {
+          if (isVerifying) {
+            Spacer(modifier = Modifier.height(10.dp))
+            LinearProgressIndicator(
+              modifier = Modifier
+                .fillMaxWidth()
+                .height(3.dp),
+              color = surfColors.progressBlue,
+              trackColor = surfColors.progressTrack,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+              text = "Completing Microsoft sign-in and connecting to Outlook\u2026",
+              style = MaterialTheme.typography.bodySmall,
+              color = surfColors.progressBlue,
+            )
+          } else if (isAwaitingMicrosoftOAuth) {
             Spacer(modifier = Modifier.height(10.dp))
             Text(
               text = "Complete Microsoft sign-in in Surf, then return to Fly.",
               style = MaterialTheme.typography.bodySmall,
               color = surfColors.progressBlue,
+            )
+          }
+          if (!accountSetupError.isNullOrBlank()) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+              text = accountSetupError,
+              style = MaterialTheme.typography.bodySmall,
+              color = surfColors.alertRed,
             )
           }
           Spacer(modifier = Modifier.height(16.dp))

@@ -8,6 +8,7 @@ import dev.hm02.mail.model.EmailAccount
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.security.KeyStore
@@ -15,6 +16,16 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+
+@Serializable
+data class PendingMicrosoftOAuthSession(
+  val state: String,
+  val codeVerifier: String,
+  val redirectUri: String,
+  val emailAddress: String,
+  val displayName: String,
+  val createdAtMillis: Long = System.currentTimeMillis(),
+)
 
 /**
  * Manages multiple [EmailAccount] configurations on-device.
@@ -49,6 +60,28 @@ class AccountStore(context: Context) {
     if (saveAccounts(updated)) {
       _accounts.value = updated
     }
+  }
+
+  @Synchronized
+  fun savePendingMicrosoftOAuth(session: PendingMicrosoftOAuthSession) {
+    runCatching {
+      prefs.edit()
+        .putString(KEY_PENDING_MS_OAUTH, json.encodeToString(session))
+        .apply()
+    }
+  }
+
+  @Synchronized
+  fun loadPendingMicrosoftOAuth(): PendingMicrosoftOAuthSession? {
+    val raw = prefs.getString(KEY_PENDING_MS_OAUTH, null) ?: return null
+    return runCatching {
+      json.decodeFromString<PendingMicrosoftOAuthSession>(raw)
+    }.getOrNull()
+  }
+
+  @Synchronized
+  fun clearPendingMicrosoftOAuth() {
+    prefs.edit().remove(KEY_PENDING_MS_OAUTH).apply()
   }
 
   private fun loadAccounts(): List<EmailAccount> {
@@ -111,6 +144,7 @@ class AccountStore(context: Context) {
     private const val PREFS_NAME = "hm02_encrypted_accounts"
     private const val KEY_ACCOUNTS_CIPHERTEXT = "accounts_blob"
     private const val KEY_ACCOUNTS_IV = "accounts_iv"
+    private const val KEY_PENDING_MS_OAUTH = "pending_ms_oauth_session"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_TAG_BITS = 128
   }

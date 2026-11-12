@@ -10,7 +10,9 @@ import dev.hm02.mail.data.ImapSmtpMailClient
 import dev.hm02.mail.data.MailClient
 import dev.hm02.mail.data.MicrosoftLoopbackOAuthServer
 import dev.hm02.mail.data.MicrosoftOAuthHelper
+import dev.hm02.mail.data.PendingMicrosoftOAuthSession
 import dev.hm02.mail.data.SettingsAndContactsStore
+import kotlinx.coroutines.delay
 import dev.hm02.mail.model.ComposeMode
 import dev.hm02.mail.model.ContactSuggestion
 import dev.hm02.mail.model.EmailAccount
@@ -142,6 +144,7 @@ data class HM02UiState(
   val isSendingEmail: Boolean = false,
   val isVerifyingAccount: Boolean = false,
   val isAwaitingMicrosoftOAuth: Boolean = false,
+  val accountSetupError: String? = null,
   val lastRefreshedAtMillis: Long? = null,
   val statusMessage: String? = null,
   val activePane: ActivePane = ActivePane.Feed,
@@ -161,6 +164,8 @@ class HM02ViewModel(
 
   @Volatile
   private var activeLoopbackServer: MicrosoftLoopbackOAuthServer? = null
+
+  private val handledOAuthCodes: MutableSet<String> = Collections.synchronizedSet(HashSet())
 
   private var latestSyncedFeedItems: List<EmailSummary> = emptyList()
 
@@ -280,7 +285,7 @@ class HM02ViewModel(
 
     val activeConfig = policyConfig
     viewModelScope.launch {
-      _uiState.update { it.copy(isRefreshingFeed = true, statusMessage = null) }
+      _uiState.update { it.copy(isRefreshingFeed = true) }
       val syncResult = mailClient.fetchFeed(accounts, activeConfig)
       latestSyncedFeedItems = syncResult.items
       val failures = syncResult.failedAccounts
@@ -308,7 +313,7 @@ class HM02ViewModel(
           failedAccountSyncs = failures,
           isRefreshingFeed = false,
           lastRefreshedAtMillis = System.currentTimeMillis(),
-          statusMessage = errorNotice,
+          statusMessage = errorNotice ?: state.statusMessage,
         )
       }
 
@@ -828,6 +833,7 @@ class HM02ViewModel(
     }
 
     viewModelScope.launch {
+      _uiState.update { it.copy(accountSetupError = null) }
       if (!skipVerification) {
         _uiState.update { it.copy(isVerifyingAccount = true, statusMessage = "Testing IMAP connection...") }
         val verifyResult = mailClient.verifyAccount(account)
@@ -836,6 +842,7 @@ class HM02ViewModel(
           _uiState.update {
             it.copy(
               isVerifyingAccount = false,
+              accountSetupError = "Connection failed: $reason",
               statusMessage = "Connection failed: $reason",
             )
           }
@@ -847,6 +854,8 @@ class HM02ViewModel(
       _uiState.update {
         it.copy(
           isVerifyingAccount = false,
+          accountSetupError = null,
+          activePane = ActivePane.Feed,
           statusMessage = "Saved account ${account.emailAddress}",
         )
       }
@@ -872,6 +881,7 @@ class HM02ViewModel(
           activeLoopbackServer = null
           result.fold(
             onSuccess = { code ->
+              if (!handledOAuthCodes.add(code)) return@fold
               val redirectUri = activeLoopbackRedirectUri ?: MicrosoftOAuthHelper.REDIRECT_URI
               completeMicrosoftOAuthSignIn(
                 authorizationCode = code,
@@ -879,15 +889,19 @@ class HM02ViewModel(
                 redirectUri = redirectUri,
                 fallbackEmail = email.trim(),
                 fallbackDisplayName = displayName.trim(),
+                initialDelayMs = 450L,
                 onSuccess = onSuccess,
               )
             },
             onFailure = { err ->
+              accountStore.clearPendingMicrosoftOAuth()
+              val msg = err.localizedMessage ?: "Microsoft sign-in was cancelled."
               _uiState.update {
                 it.copy(
                   isAwaitingMicrosoftOAuth = false,
                   isVerifyingAccount = false,
-                  statusMessage = err.localizedMessage ?: "Microsoft sign-in was cancelled.",
+                  accountSetupError = msg,
+                  statusMessage = msg,
                 )
               }
             },
@@ -895,10 +909,12 @@ class HM02ViewModel(
         },
       )
     } catch (e: Exception) {
+      val msg = "Failed to start local OAuth listener: ${e.localizedMessage ?: "Unknown error"}"
       _uiState.update {
         it.copy(
           isAwaitingMicrosoftOAuth = false,
-          statusMessage = "Failed to start local OAuth listener: ${e.localizedMessage ?: "Unknown error"}",
+          accountSetupError = msg,
+          statusMessage = msg,
         )
       }
       return
@@ -906,6 +922,15 @@ class HM02ViewModel(
 
     activeLoopbackServer = server
     activeLoopbackRedirectUri = server.redirectUri
+    accountStore.savePendingMicrosoftOAuth(
+      PendingMicrosoftOAuthSession(
+        state = pkce.state,
+        codeVerifier = pkce.codeVerifier,
+        redirectUri = server.redirectUri,
+        emailAddress = email.trim(),
+        displayName = displayName.trim(),
+      ),
+    )
 
     val authorizeUrl = MicrosoftOAuthHelper.buildAuthorizationUrl(
       pkce = pkce,
@@ -916,6 +941,7 @@ class HM02ViewModel(
     _uiState.update {
       it.copy(
         isAwaitingMicrosoftOAuth = true,
+        accountSetupError = null,
         statusMessage = null,
       )
     }
@@ -923,10 +949,13 @@ class HM02ViewModel(
     if (!openBrowserUrl(authorizeUrl)) {
       server.close()
       activeLoopbackServer = null
+      accountStore.clearPendingMicrosoftOAuth()
+      val msg = "Could not open Surf browser for Microsoft sign-in."
       _uiState.update {
         it.copy(
           isAwaitingMicrosoftOAuth = false,
-          statusMessage = "Could not open Surf browser for Microsoft sign-in.",
+          accountSetupError = msg,
+          statusMessage = msg,
         )
       }
     }
@@ -935,13 +964,75 @@ class HM02ViewModel(
   @Volatile
   private var activeLoopbackRedirectUri: String? = null
 
+  fun handleOAuthCallbackUri(rawUri: String?) {
+    if (rawUri.isNullOrBlank()) return
+    if (!rawUri.startsWith(MicrosoftOAuthHelper.APP_RETURN_URI, ignoreCase = true)) return
+
+    val params = MicrosoftOAuthHelper.parseQueryParameters(rawUri)
+    val code = params["code"]?.trim().orEmpty()
+    val returnedState = params["state"]?.trim().orEmpty()
+    val error = params["error"]?.trim().orEmpty()
+    val errorDesc = params["error_description"]?.trim().orEmpty()
+
+    if (code.isEmpty() && error.isEmpty() && errorDesc.isEmpty()) return
+
+    val pending = accountStore.loadPendingMicrosoftOAuth()
+    if (error.isNotEmpty() || errorDesc.isNotEmpty()) {
+      activeLoopbackServer?.close()
+      activeLoopbackServer = null
+      accountStore.clearPendingMicrosoftOAuth()
+      val msg = errorDesc.ifBlank { error }
+      _uiState.update {
+        it.copy(
+          activePane = ActivePane.Accounts,
+          isAwaitingMicrosoftOAuth = false,
+          isVerifyingAccount = false,
+          accountSetupError = msg,
+          statusMessage = msg,
+        )
+      }
+      return
+    }
+
+    if (pending == null) return
+    if (pending.state.isNotBlank() && returnedState.isNotBlank() && pending.state != returnedState) {
+      accountStore.clearPendingMicrosoftOAuth()
+      val msg = "OAuth state mismatch. Please try signing in again."
+      _uiState.update {
+        it.copy(
+          activePane = ActivePane.Accounts,
+          isAwaitingMicrosoftOAuth = false,
+          isVerifyingAccount = false,
+          accountSetupError = msg,
+          statusMessage = msg,
+        )
+      }
+      return
+    }
+
+    if (code.isNotEmpty() && handledOAuthCodes.add(code)) {
+      activeLoopbackServer?.close()
+      activeLoopbackServer = null
+      completeMicrosoftOAuthSignIn(
+        authorizationCode = code,
+        codeVerifier = pending.codeVerifier,
+        redirectUri = pending.redirectUri,
+        fallbackEmail = pending.emailAddress,
+        fallbackDisplayName = pending.displayName,
+        initialDelayMs = 150L,
+      )
+    }
+  }
+
   fun cancelMicrosoftOAuthSignIn() {
     activeLoopbackServer?.close()
     activeLoopbackServer = null
     activeLoopbackRedirectUri = null
+    accountStore.clearPendingMicrosoftOAuth()
     _uiState.update {
       it.copy(
         isAwaitingMicrosoftOAuth = false,
+        accountSetupError = null,
         statusMessage = "Microsoft sign-in cancelled.",
       )
     }
@@ -959,6 +1050,7 @@ class HM02ViewModel(
     redirectUri: String = MicrosoftOAuthHelper.REDIRECT_URI,
     fallbackEmail: String,
     fallbackDisplayName: String,
+    initialDelayMs: Long = 0L,
     onSuccess: () -> Unit = {},
   ) {
     viewModelScope.launch {
@@ -966,8 +1058,12 @@ class HM02ViewModel(
         it.copy(
           isAwaitingMicrosoftOAuth = false,
           isVerifyingAccount = true,
+          accountSetupError = null,
           statusMessage = "Completing Microsoft sign-in...",
         )
+      }
+      if (initialDelayMs > 0L) {
+        delay(initialDelayMs)
       }
       val tokenResult = MicrosoftOAuthHelper.exchangeAuthorizationCode(
         code = authorizationCode,
@@ -976,10 +1072,12 @@ class HM02ViewModel(
       )
       if (tokenResult.isFailure) {
         val reason = tokenResult.exceptionOrNull()?.localizedMessage ?: "Failed to exchange Microsoft OAuth code"
+        val errMsg = "Microsoft sign-in failed: $reason"
         _uiState.update {
           it.copy(
             isVerifyingAccount = false,
-            statusMessage = "Microsoft sign-in failed: $reason",
+            accountSetupError = errMsg,
+            statusMessage = errMsg,
           )
         }
         return@launch
@@ -989,10 +1087,12 @@ class HM02ViewModel(
       val resolvedEmail = token.emailAddress?.trim()?.takeIf { it.isNotBlank() }
         ?: fallbackEmail.trim()
       if (resolvedEmail.isBlank()) {
+        val errMsg = "Please enter your Outlook email address before signing in."
         _uiState.update {
           it.copy(
             isVerifyingAccount = false,
-            statusMessage = "Please enter your Outlook email address before signing in.",
+            accountSetupError = errMsg,
+            statusMessage = errMsg,
           )
         }
         return@launch
@@ -1022,23 +1122,37 @@ class HM02ViewModel(
           statusMessage = "Testing Outlook IMAP connection...",
         )
       }
-      val verifyResult = mailClient.verifyAccount(newAccount)
+
+      var verifyResult: Result<Unit> = Result.failure(IllegalStateException("IMAP XOAUTH2 verification failed"))
+      for (attempt in 1..3) {
+        verifyResult = mailClient.verifyAccount(newAccount)
+        if (verifyResult.isSuccess) break
+        if (attempt < 3) {
+          delay(750L * attempt)
+        }
+      }
+
       if (verifyResult.isFailure) {
         val reason = verifyResult.exceptionOrNull()?.localizedMessage ?: "IMAP XOAUTH2 verification failed"
+        val errMsg = "Outlook connection failed: $reason"
         _uiState.update {
           it.copy(
             isVerifyingAccount = false,
-            statusMessage = "Outlook connection failed: $reason",
+            accountSetupError = errMsg,
+            statusMessage = errMsg,
           )
         }
         return@launch
       }
 
+      accountStore.clearPendingMicrosoftOAuth()
       accountStore.addOrUpdateAccount(newAccount)
       onSuccess()
       _uiState.update {
         it.copy(
           isVerifyingAccount = false,
+          accountSetupError = null,
+          activePane = ActivePane.Feed,
           statusMessage = "Saved Outlook account $resolvedEmail",
         )
       }
