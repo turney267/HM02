@@ -1,9 +1,11 @@
 package dev.hm02.mail.ui.main
 
 import android.Manifest
+import android.content.ContentResolver
 import android.content.Intent
 import android.net.Uri
 import android.provider.ContactsContract
+import android.provider.OpenableColumns
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -75,6 +77,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -109,10 +112,14 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.hm02.mail.data.MAX_OUTGOING_ATTACHMENTS_BYTES
 import dev.hm02.mail.data.parseQuickDaySearchDays
+import dev.hm02.mail.data.sanitizeAttachmentFileName
 import dev.hm02.mail.model.ComposeMode
 import dev.hm02.mail.model.ContactSuggestion
+import dev.hm02.mail.model.DraftAttachment
 import dev.hm02.mail.model.EmailAccount
+import dev.hm02.mail.model.EmailAttachment
 import dev.hm02.mail.model.EmailDetail
 import dev.hm02.mail.model.EmailSummary
 import dev.hm02.mail.model.MailAuthType
@@ -124,8 +131,10 @@ import dev.hm02.mail.ui.theme.LocalSurfColors
 import dev.hm02.mail.ui.theme.SpaceGroteskFontFamily
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -267,6 +276,7 @@ fun HM02AppScreen(
             enablePinToFeed = uiState.settings.enablePinToFeed,
             onEmailClick = viewModel::openMessage,
             onTogglePin = viewModel::toggleFlagged,
+            onRefreshSearch = viewModel::refreshSearch,
             onBackToFeed = viewModel::clearSearchAndReturnToFeed,
           )
         }
@@ -277,6 +287,7 @@ fun HM02AppScreen(
             detail = pane.detail,
             isLoading = pane.isLoading,
             error = pane.error,
+            downloadingAttachmentPartId = uiState.downloadingAttachmentPartId,
             blockRemoteMedia = uiState.blockRemoteMediaInEmails,
             blockExternalImages = uiState.blockExternalImagesByDefault,
             forceBlockExternalImages = uiState.forceBlockExternalImages,
@@ -285,6 +296,7 @@ fun HM02AppScreen(
             accessDeviceContacts = uiState.settings.accessDeviceContacts,
             onTogglePin = { viewModel.toggleFlagged(pane.summary) },
             onSaveSenderContact = { viewModel.saveSenderContact(pane.summary) },
+            onSaveAttachment = viewModel::saveAttachmentToUri,
             onComposeMailto = viewModel::startComposeFromMailto,
             onBack = viewModel::closeReader,
             onReply = { detail -> viewModel.startReply(detail) },
@@ -300,6 +312,7 @@ fun HM02AppScreen(
             contactSuggestions = uiState.contactSuggestions,
             onContactQueryChange = viewModel::updateContactAutocompleteQuery,
             onClearContactSuggestions = viewModel::clearContactSuggestions,
+            onReportStatusMessage = viewModel::reportStatusMessage,
             onSend = viewModel::sendDraft,
             onCancel = viewModel::showFeed,
           )
@@ -833,11 +846,12 @@ private fun SearchResultsPane(
   enablePinToFeed: Boolean,
   onEmailClick: (EmailSummary) -> Unit,
   onTogglePin: (EmailSummary) -> Unit,
+  onRefreshSearch: () -> Unit,
   onBackToFeed: () -> Unit,
 ) {
   val surfColors = LocalSurfColors.current
   val quickDays = remember(query, maxSearchDays) { parseQuickDaySearchDays(query, maxDays = maxSearchDays) }
-  val headerDescription = if (isSearching) {
+  val headerDescription = if (isSearching && results.isEmpty()) {
     "Searching..."
   } else {
     when (quickDays) {
@@ -864,16 +878,33 @@ private fun SearchResultsPane(
         label = "\u2190 Inbox",
         onClick = onBackToFeed,
       )
-      Text(
-        text = headerDescription,
-        fontFamily = SpaceGroteskFontFamily,
-        fontWeight = FontWeight.Medium,
-        fontSize = 12.5.sp,
-        color = surfColors.secondaryText,
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis,
-        modifier = Modifier.padding(start = 10.dp),
-      )
+      Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+      ) {
+        Text(
+          text = headerDescription,
+          fontFamily = SpaceGroteskFontFamily,
+          fontWeight = FontWeight.Medium,
+          fontSize = 12.5.sp,
+          color = surfColors.secondaryText,
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+          modifier = Modifier.padding(start = 10.dp),
+        )
+        IconButton(
+          onClick = onRefreshSearch,
+          enabled = !isSearching,
+          modifier = Modifier.size(28.dp),
+        ) {
+          Icon(
+            imageVector = Icons.Default.Refresh,
+            contentDescription = "Refresh search",
+            tint = surfColors.secondaryText,
+            modifier = Modifier.size(16.dp),
+          )
+        }
+      }
     }
 
     HorizontalDivider(
@@ -882,7 +913,17 @@ private fun SearchResultsPane(
       modifier = Modifier.padding(horizontal = 18.dp),
     )
 
-    if (isSearching) {
+    if (isSearching && results.isNotEmpty()) {
+      LinearProgressIndicator(
+        modifier = Modifier
+          .fillMaxWidth()
+          .height(2.dp),
+        color = surfColors.cyanDeep,
+        trackColor = surfColors.cyanSoft,
+      )
+    }
+
+    if (isSearching && results.isEmpty()) {
       Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         CircularProgressIndicator(color = surfColors.cyanDeep)
       }
@@ -1000,6 +1041,13 @@ private fun EmailSummaryRow(
           verticalAlignment = Alignment.CenterVertically,
           horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+          if (email.hasAttachments) {
+            Text(
+              text = "\uD83D\uDCCE",
+              fontSize = 11.5.sp,
+              color = surfColors.mutedText,
+            )
+          }
           Text(
             text = formatTimestamp(email.receivedAtEpochMillis),
             fontFamily = SpaceGroteskFontFamily,
@@ -1054,12 +1102,14 @@ private fun EmailSummaryRow(
   }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun EmailReaderPane(
   summary: EmailSummary,
   detail: EmailDetail?,
   isLoading: Boolean,
   error: String?,
+  downloadingAttachmentPartId: String?,
   blockRemoteMedia: Boolean,
   blockExternalImages: Boolean,
   forceBlockExternalImages: Boolean,
@@ -1068,6 +1118,7 @@ private fun EmailReaderPane(
   accessDeviceContacts: Boolean,
   onTogglePin: () -> Unit,
   onSaveSenderContact: () -> Unit,
+  onSaveAttachment: (EmailDetail, EmailAttachment, ContentResolver, Uri) -> Unit,
   onComposeMailto: (to: String, cc: String, subject: String, body: String) -> Unit,
   onBack: () -> Unit,
   onReply: (EmailDetail) -> Unit,
@@ -1076,6 +1127,16 @@ private fun EmailReaderPane(
   val surfColors = LocalSurfColors.current
   val context = LocalContext.current
   var loadRemoteImagesForEmail by remember(summary.compositeKey) { mutableStateOf(false) }
+  var pendingSaveAttachment by remember(summary.compositeKey) { mutableStateOf<EmailAttachment?>(null) }
+  val saveAttachmentLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.CreateDocument("*/*"),
+  ) { uri ->
+    val targetAttachment = pendingSaveAttachment
+    pendingSaveAttachment = null
+    if (uri != null && targetAttachment != null && detail != null) {
+      onSaveAttachment(detail, targetAttachment, context.contentResolver, uri)
+    }
+  }
   val effectiveAllowImages = !forceBlockExternalImages && (!blockExternalImages || loadRemoteImagesForEmail)
   val currentEffectiveAllowImages by rememberUpdatedState(effectiveAllowImages)
   val currentAllowExternalLinks by rememberUpdatedState(allowExternalLinks)
@@ -1201,6 +1262,63 @@ private fun EmailReaderPane(
             style = MaterialTheme.typography.bodySmall,
             color = surfColors.secondaryText,
           )
+        }
+        if (detail != null && detail.attachments.isNotEmpty()) {
+          FlowRow(
+            modifier = Modifier
+              .fillMaxWidth()
+              .padding(top = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+          ) {
+            detail.attachments.forEach { attachment ->
+              val isDownloadingThis = downloadingAttachmentPartId == attachment.partId
+              val sizeLabel = formatAttachmentSize(attachment.sizeBytes)
+              val chipText = buildString {
+                append("\uD83D\uDCCE ")
+                append(attachment.fileName)
+                if (sizeLabel != null) {
+                  append(" \u00B7 ")
+                  append(sizeLabel)
+                }
+                append(if (isDownloadingThis) " \u00B7 Saving..." else " \u2193")
+              }
+              Surface(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(10.dp))
+                  .clickable(enabled = downloadingAttachmentPartId == null) {
+                    pendingSaveAttachment = attachment
+                    saveAttachmentLauncher.launch(attachment.fileName)
+                  },
+                shape = RoundedCornerShape(10.dp),
+                color = surfColors.cyanSoft,
+                border = BorderStroke(1.dp, surfColors.cardStroke),
+              ) {
+                Row(
+                  modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                  if (isDownloadingThis) {
+                    CircularProgressIndicator(
+                      modifier = Modifier.size(12.dp),
+                      strokeWidth = 1.8.dp,
+                      color = surfColors.cyanDeep,
+                    )
+                  }
+                  Text(
+                    text = chipText,
+                    fontFamily = SpaceGroteskFontFamily,
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 11.5.sp,
+                    color = surfColors.cyanDeep,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                  )
+                }
+              }
+            }
+          }
         }
       }
 
@@ -1449,6 +1567,7 @@ private fun EmailReaderPane(
  * of [EmailReaderPane]: borderless Subject, From (tappable to change sender account), To, and Cc
  * in the top metadata block, a 1dp divider, and a borderless full-screen message body below.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ComposeEmailPane(
   accounts: List<EmailAccount>,
@@ -1457,15 +1576,20 @@ private fun ComposeEmailPane(
   contactSuggestions: List<ContactSuggestion>,
   onContactQueryChange: (String) -> Unit,
   onClearContactSuggestions: () -> Unit,
+  onReportStatusMessage: (String) -> Unit,
   onSend: (OutgoingEmailDraft) -> Unit,
   onCancel: () -> Unit,
 ) {
   val surfColors = LocalSurfColors.current
+  val context = LocalContext.current
+  val coroutineScope = rememberCoroutineScope()
   var selectedAccount by remember(initialDraft) { mutableStateOf(initialDraft.fromAccount) }
   var showSenderDropdown by remember { mutableStateOf(false) }
   var to by rememberSaveable(initialDraft) { mutableStateOf(initialDraft.to) }
   var cc by rememberSaveable(initialDraft) { mutableStateOf(initialDraft.cc) }
   var subject by rememberSaveable(initialDraft) { mutableStateOf(initialDraft.subject) }
+  var attachments by remember(initialDraft) { mutableStateOf(initialDraft.attachments) }
+  var isLoadingAttachments by remember { mutableStateOf(false) }
   var activeRecipientField by remember { mutableStateOf("to") }
   var bodyField by remember(initialDraft) {
     mutableStateOf(
@@ -1474,6 +1598,50 @@ private fun ComposeEmailPane(
         selection = TextRange(0), // Place cursor at the very top above the 2 blank lines
       ),
     )
+  }
+
+  val pickAttachmentsLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.OpenMultipleDocuments(),
+  ) { uris ->
+    if (uris.isEmpty()) return@rememberLauncherForActivityResult
+    coroutineScope.launch {
+      isLoadingAttachments = true
+      val existingTotal = attachments.sumOf { it.sizeBytes }
+      val (added, errorMessage) = withContext(Dispatchers.IO) {
+        val collected = mutableListOf<DraftAttachment>()
+        var runningTotal = existingTotal
+        var firstError: String? = null
+        for (uri in uris) {
+          val remaining = MAX_OUTGOING_ATTACHMENTS_BYTES - runningTotal
+          if (remaining <= 0L) {
+            firstError = "Total attachment size cannot exceed 20 MB."
+            break
+          }
+          val loaded = runCatching {
+            readPickedAttachmentFromUri(context.contentResolver, uri, remaining)
+          }
+          loaded.fold(
+            onSuccess = { item ->
+              runningTotal += item.sizeBytes
+              collected += item
+            },
+            onFailure = { err ->
+              if (firstError == null) {
+                firstError = err.localizedMessage ?: "Could not attach selected file."
+              }
+            },
+          )
+        }
+        collected to firstError
+      }
+      if (added.isNotEmpty()) {
+        attachments = attachments + added
+      }
+      isLoadingAttachments = false
+      if (!errorMessage.isNullOrBlank()) {
+        onReportStatusMessage(errorMessage)
+      }
+    }
   }
 
   val modeLabel = when (initialDraft.mode) {
@@ -1511,7 +1679,7 @@ private fun ComposeEmailPane(
       SurfPillButton(
         label = if (isSending) "Sending..." else "Send \u2191",
         isPrimary = true,
-        enabled = !isSending,
+        enabled = !isSending && !isLoadingAttachments,
         onClick = {
           onSend(
             initialDraft.copy(
@@ -1520,6 +1688,7 @@ private fun ComposeEmailPane(
               cc = cc,
               subject = subject,
               body = bodyField.text,
+              attachments = attachments,
             ),
           )
         },
@@ -1731,6 +1900,63 @@ private fun ComposeEmailPane(
                 color = surfColors.mutedText,
               )
             }
+          }
+        }
+      }
+
+      FlowRow(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(top = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+      ) {
+        Surface(
+          modifier = Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(enabled = !isSending && !isLoadingAttachments) {
+              pickAttachmentsLauncher.launch(arrayOf("*/*"))
+            },
+          shape = RoundedCornerShape(10.dp),
+          color = surfColors.pillBg,
+          border = BorderStroke(1.dp, surfColors.cardStroke),
+        ) {
+          Text(
+            text = if (isLoadingAttachments) "\uD83D\uDCCE Adding..." else "+ Attach",
+            fontFamily = SpaceGroteskFontFamily,
+            fontWeight = FontWeight.Medium,
+            fontSize = 11.5.sp,
+            color = surfColors.primaryText,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+          )
+        }
+        attachments.forEach { attachment ->
+          val sizeLabel = formatAttachmentSize(attachment.sizeBytes)
+          val chipText = if (sizeLabel != null) {
+            "\uD83D\uDCCE ${attachment.fileName} \u00B7 $sizeLabel \u2715"
+          } else {
+            "\uD83D\uDCCE ${attachment.fileName} \u2715"
+          }
+          Surface(
+            modifier = Modifier
+              .clip(RoundedCornerShape(10.dp))
+              .clickable(enabled = !isSending) {
+                attachments = attachments.filterNot { it.id == attachment.id }
+              },
+            shape = RoundedCornerShape(10.dp),
+            color = surfColors.cyanSoft,
+            border = BorderStroke(1.dp, surfColors.cardStroke),
+          ) {
+            Text(
+              text = chipText,
+              fontFamily = SpaceGroteskFontFamily,
+              fontWeight = FontWeight.Medium,
+              fontSize = 11.5.sp,
+              color = surfColors.cyanDeep,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
+              modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            )
           }
         }
       }
@@ -2956,4 +3182,77 @@ private fun formatTimestamp(epochMillis: Long): String {
 private fun formatFullTimestamp(epochMillis: Long): String {
   if (epochMillis <= 0L) return ""
   return SimpleDateFormat("EEE, MMM d, yyyy • HH:mm", Locale.getDefault()).format(Date(epochMillis))
+}
+
+private fun formatAttachmentSize(sizeBytes: Long): String? {
+  if (sizeBytes < 0L) return null
+  return when {
+    sizeBytes < 1024L -> "$sizeBytes B"
+    sizeBytes < 1024L * 1024L -> "${((sizeBytes + 512L) / 1024L).coerceAtLeast(1L)} KB"
+    else -> String.format(Locale.US, "%.1f MB", sizeBytes / (1024.0 * 1024.0))
+  }
+}
+
+private fun readPickedAttachmentFromUri(
+  contentResolver: ContentResolver,
+  uri: Uri,
+  remainingBudgetBytes: Long,
+): DraftAttachment {
+  var displayName: String? = null
+  var declaredSize = -1L
+  contentResolver.query(
+    uri,
+    arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+    null,
+    null,
+    null,
+  )?.use { cursor ->
+    if (cursor.moveToFirst()) {
+      val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+      if (nameIdx >= 0) {
+        displayName = cursor.getString(nameIdx)
+      }
+      val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+      if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+        declaredSize = cursor.getLong(sizeIdx)
+      }
+    }
+  }
+  val fallbackName = uri.lastPathSegment
+    ?.substringAfterLast('/')
+    ?.takeIf { it.isNotBlank() }
+    ?: "attachment"
+  val safeName = sanitizeAttachmentFileName(displayName ?: fallbackName, fallback = "attachment")
+  if (declaredSize > remainingBudgetBytes) {
+    throw IllegalArgumentException("Adding $safeName exceeds the 20 MB total attachment limit.")
+  }
+  val bytes = contentResolver.openInputStream(uri)?.use { input ->
+    val out = ByteArrayOutputStream()
+    val buffer = ByteArray(16_384)
+    var total = 0L
+    while (true) {
+      val read = input.read(buffer)
+      if (read < 0) break
+      total += read
+      if (total > remainingBudgetBytes) {
+        throw IllegalArgumentException("Adding $safeName exceeds the 20 MB total attachment limit.")
+      }
+      out.write(buffer, 0, read)
+    }
+    out.toByteArray()
+  } ?: throw IllegalStateException("Could not open selected file.")
+
+  val mimeType = contentResolver.getType(uri)
+    ?.substringBefore(';')
+    ?.trim()
+    ?.lowercase(Locale.US)
+    ?.takeIf { it.contains('/') }
+    ?: "application/octet-stream"
+
+  return DraftAttachment(
+    fileName = safeName,
+    mimeType = mimeType,
+    sizeBytes = bytes.size.toLong(),
+    bytes = bytes,
+  )
 }

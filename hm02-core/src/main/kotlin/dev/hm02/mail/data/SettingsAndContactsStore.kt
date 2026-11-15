@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.security.KeyStore
@@ -27,6 +28,13 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+
+@Serializable
+data class CachedDayWindowSummaries(
+  val items: List<EmailSummary> = emptyList(),
+  val syncedAtEpochMillis: Long = 0L,
+  val maxDaysCovered: Int = 0,
+)
 
 /**
  * Manages user-configurable settings ([UserSettings]), locally persisted flagged emails
@@ -386,6 +394,74 @@ class SettingsAndContactsStore(context: Context) {
     return keyGenerator.generateKey()
   }
 
+  @Synchronized
+  fun loadCachedFeedSummaries(): List<EmailSummary> {
+    val raw = readEncryptedOrLegacyJson(KEY_CACHED_FEED_SUMMARIES) ?: return emptyList()
+    return runCatching { json.decodeFromString<List<EmailSummary>>(raw) }
+      .getOrDefault(emptyList())
+  }
+
+  @Synchronized
+  fun saveCachedFeedSummaries(items: List<EmailSummary>) {
+    val capped = items
+      .distinctBy { it.compositeKey }
+      .sortedByDescending { it.receivedAtEpochMillis }
+      .take(MAX_CACHED_SUMMARY_ITEMS)
+    val encoded = json.encodeToString(capped)
+    writeEncryptedJson(KEY_CACHED_FEED_SUMMARIES, encoded)
+  }
+
+  @Synchronized
+  fun loadCachedDayWindowSummaries(): CachedDayWindowSummaries {
+    val raw = readEncryptedOrLegacyJson(KEY_CACHED_DAY_WINDOW_SUMMARIES)
+      ?: return CachedDayWindowSummaries()
+    return runCatching { json.decodeFromString<CachedDayWindowSummaries>(raw) }
+      .getOrDefault(CachedDayWindowSummaries())
+  }
+
+  @Synchronized
+  fun saveCachedDayWindowSummaries(
+    items: List<EmailSummary>,
+    syncedAtEpochMillis: Long,
+    maxDaysCovered: Int = 2,
+  ) {
+    val capped = CachedDayWindowSummaries(
+      items = items
+        .distinctBy { it.compositeKey }
+        .sortedByDescending { it.receivedAtEpochMillis }
+        .take(MAX_CACHED_DAY_WINDOW_ITEMS),
+      syncedAtEpochMillis = syncedAtEpochMillis,
+      maxDaysCovered = maxDaysCovered,
+    )
+    val encoded = json.encodeToString(capped)
+    writeEncryptedJson(KEY_CACHED_DAY_WINDOW_SUMMARIES, encoded)
+  }
+
+  @Synchronized
+  fun loadCachedEmailDetails(): List<EmailDetail> {
+    val raw = readEncryptedOrLegacyJson(KEY_CACHED_EMAIL_DETAILS) ?: return emptyList()
+    return runCatching { json.decodeFromString<List<EmailDetail>>(raw) }
+      .getOrDefault(emptyList())
+  }
+
+  @Synchronized
+  fun saveCachedEmailDetails(details: List<EmailDetail>) {
+    val capped = details
+      .takeLast(MAX_CACHED_PERSISTED_DETAILS)
+      .map { detail ->
+        detail.copy(
+          plainTextBody = detail.plainTextBody?.let {
+            if (it.length > MAX_PERSISTED_BODY_CHARS) it.substring(0, MAX_PERSISTED_BODY_CHARS) else it
+          },
+          htmlBody = detail.htmlBody?.let {
+            if (it.length > MAX_PERSISTED_BODY_CHARS) it.substring(0, MAX_PERSISTED_BODY_CHARS) else it
+          },
+        )
+      }
+    val encoded = json.encodeToString(capped)
+    writeEncryptedJson(KEY_CACHED_EMAIL_DETAILS, encoded)
+  }
+
   companion object {
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val KEY_ALIAS = "hm02_settings_contacts_aes_key"
@@ -393,9 +469,16 @@ class SettingsAndContactsStore(context: Context) {
     private const val GCM_TAG_BITS = 128
     private const val ENCRYPTED_PREFIX = "enc:v1:"
     private const val MAX_SAVED_CONTACTS = 500
+    private const val MAX_CACHED_SUMMARY_ITEMS = 150
+    private const val MAX_CACHED_DAY_WINDOW_ITEMS = 200
+    private const val MAX_CACHED_PERSISTED_DETAILS = 60
+    private const val MAX_PERSISTED_BODY_CHARS = 64_000
     private const val PREFS_FILE_NAME = "hm02_settings_and_contacts"
     private const val KEY_USER_SETTINGS = "user_settings_v1"
     private const val KEY_FLAGGED_EMAILS = "flagged_emails_v1"
     private const val KEY_SAVED_CONTACTS = "saved_contacts_v1"
+    private const val KEY_CACHED_FEED_SUMMARIES = "cached_feed_summaries_v1"
+    private const val KEY_CACHED_DAY_WINDOW_SUMMARIES = "cached_day_window_summaries_v1"
+    private const val KEY_CACHED_EMAIL_DETAILS = "cached_email_details_v1"
   }
 }

@@ -141,6 +141,22 @@ data class EmailAccount(
  * No bodies are downloaded until the user taps an email to read it.
  */
 @Serializable
+data class EmailAttachment(
+  val partId: String,
+  val fileName: String,
+  val mimeType: String,
+  val sizeBytes: Long,
+)
+
+data class DraftAttachment(
+  val id: String = java.util.UUID.randomUUID().toString(),
+  val fileName: String,
+  val mimeType: String,
+  val sizeBytes: Long,
+  val bytes: ByteArray,
+)
+
+@Serializable
 data class EmailSummary(
   val uid: Long,
   val accountId: String,
@@ -154,6 +170,7 @@ data class EmailSummary(
   val isUnread: Boolean,
   val isFlagged: Boolean = false,
   val replyToAddress: String? = null,
+  val hasAttachments: Boolean = false,
 ) {
   val compositeKey: String
     get() = "$accountId:$uid"
@@ -162,6 +179,7 @@ data class EmailSummary(
 /**
  * Full on-demand email detail fetched when reading a specific message.
  */
+@Serializable
 data class EmailDetail(
   val summary: EmailSummary,
   val toAddresses: List<String>,
@@ -171,6 +189,7 @@ data class EmailDetail(
   val referencesHeader: String?,
   val plainTextBody: String?,
   val htmlBody: String?,
+  val attachments: List<EmailAttachment> = emptyList(),
 )
 
 enum class ComposeMode {
@@ -191,6 +210,7 @@ data class OutgoingEmailDraft(
   val mode: ComposeMode = ComposeMode.NEW,
   val inReplyToMessageId: String? = null,
   val referencesHeader: String? = null,
+  val attachments: List<DraftAttachment> = emptyList(),
 )
 
 /**

@@ -1,6 +1,8 @@
 package dev.hm02.mail.data
 
+import dev.hm02.mail.model.DraftAttachment
 import dev.hm02.mail.model.EmailAccount
+import dev.hm02.mail.model.EmailAttachment
 import dev.hm02.mail.model.EmailDetail
 import dev.hm02.mail.model.EmailSummary
 import dev.hm02.mail.model.MailProviderPreset
@@ -13,13 +15,18 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.charset.Charset
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.Properties
 import java.util.concurrent.ConcurrentHashMap
+import javax.activation.DataHandler
+import javax.activation.DataSource
 import javax.mail.Address
 import javax.mail.Authenticator
 import javax.mail.FetchProfile
@@ -35,7 +42,9 @@ import javax.mail.Transport
 import javax.mail.UIDFolder
 import javax.mail.internet.ContentType
 import javax.mail.internet.InternetAddress
+import javax.mail.internet.MimeBodyPart
 import javax.mail.internet.MimeMessage
+import javax.mail.internet.MimeMultipart
 import javax.mail.internet.MimeUtility
 import javax.mail.search.BodyTerm
 import javax.mail.search.ComparisonTerm
@@ -102,6 +111,8 @@ private val WHITESPACE_SPLIT_REGEX = Regex("\\s+")
 internal const val MAX_MIME_DEPTH = 10
 internal const val MAX_MIME_PARTS = 64
 internal const val MAX_TEXT_BODY_BYTES = 1_048_576
+internal const val MAX_ATTACHMENT_DOWNLOAD_BYTES = 25 * 1024 * 1024
+internal const val MAX_OUTGOING_ATTACHMENTS_BYTES = 20L * 1024L * 1024L
 private const val TIMEOUT_MILLIS = "15000"
 
 /**
@@ -302,6 +313,7 @@ internal fun buildSmtpProperties(account: EmailAccount): Properties {
 internal class ExtractedBody(
   var plainText: String? = null,
   var htmlText: String? = null,
+  val attachments: MutableList<EmailAttachment> = mutableListOf(),
   var partsVisited: Int = 0,
 )
 
@@ -309,34 +321,201 @@ internal fun extractMimeContent(
   part: Part,
   out: ExtractedBody,
   depth: Int = 0,
+  partPath: String = "0",
 ) {
   if (depth > MAX_MIME_DEPTH || out.partsVisited >= MAX_MIME_PARTS) return
-  if (out.plainText != null && out.htmlText != null) return
   out.partsVisited++
 
   val disposition = runCatching { part.disposition }.getOrNull()
-  if (Part.ATTACHMENT.equals(disposition, ignoreCase = true)) {
+  val isExplicitAttachment = Part.ATTACHMENT.equals(disposition, ignoreCase = true)
+  val rawFileName = runCatching { part.fileName }.getOrNull()
+  val isMultipart = runCatching { part.isMimeType("multipart/*") }.getOrDefault(false)
+  val isPlainOrHtml = runCatching {
+    part.isMimeType("text/plain") || part.isMimeType("text/html")
+  }.getOrDefault(false)
+
+  if (isExplicitAttachment || (!isMultipart && !isPlainOrHtml && !rawFileName.isNullOrBlank())) {
+    val cleanFileName = sanitizeAttachmentFileName(
+      rawFileName?.let { runCatching { MimeUtility.decodeText(it) }.getOrDefault(it) },
+      fallback = "attachment-${out.attachments.size + 1}",
+    )
+    val cleanMime = runCatching {
+      part.contentType?.let { ContentType(it).baseType }
+    }.getOrNull()
+      ?.lowercase(Locale.US)
+      ?.takeIf { it.contains('/') }
+      ?: "application/octet-stream"
+    val approxSize = runCatching { part.size.toLong() }.getOrDefault(-1L)
+    out.attachments += EmailAttachment(
+      partId = partPath,
+      fileName = cleanFileName,
+      mimeType = cleanMime,
+      sizeBytes = approxSize,
+    )
     return
   }
 
   when {
-    part.isMimeType("text/plain") && out.plainText == null -> {
-      out.plainText = readBoundedPartText(part, MAX_TEXT_BODY_BYTES)
+    part.isMimeType("text/plain") -> {
+      if (out.plainText == null) {
+        out.plainText = readBoundedPartText(part, MAX_TEXT_BODY_BYTES)
+      }
     }
-    part.isMimeType("text/html") && out.htmlText == null -> {
-      out.htmlText = readBoundedPartText(part, MAX_TEXT_BODY_BYTES)
+    part.isMimeType("text/html") -> {
+      if (out.htmlText == null) {
+        out.htmlText = readBoundedPartText(part, MAX_TEXT_BODY_BYTES)
+      }
     }
-    part.isMimeType("multipart/*") -> {
+    isMultipart -> {
       if (depth >= MAX_MIME_DEPTH) return
       val multipart = runCatching { part.content as? Multipart }.getOrNull() ?: return
       val count = runCatching { multipart.count }.getOrDefault(0)
       for (i in 0 until count) {
-        if (out.partsVisited >= MAX_MIME_PARTS || (out.plainText != null && out.htmlText != null)) {
+        if (out.partsVisited >= MAX_MIME_PARTS) {
           break
         }
         val bodyPart = runCatching { multipart.getBodyPart(i) }.getOrNull() ?: continue
-        extractMimeContent(bodyPart, out, depth + 1)
+        extractMimeContent(bodyPart, out, depth + 1, "$partPath.$i")
       }
+    }
+  }
+}
+
+internal fun sanitizeAttachmentFileName(
+  rawName: String?,
+  fallback: String = "attachment",
+): String {
+  val sanitized = sanitizeHeaderControlChars(rawName.orEmpty())
+    .replace('/', '_')
+    .replace('\\', '_')
+    .replace("..", "_")
+    .trim()
+  return sanitized.take(180).ifBlank { fallback }
+}
+
+internal fun findMimePartByPath(root: Part, partPath: String): Part? {
+  val segments = partPath.split('.')
+  if (segments.isEmpty() || segments[0] != "0") return null
+  var current: Part = root
+  for (i in 1 until segments.size) {
+    val childIndex = segments[i].toIntOrNull() ?: return null
+    val multipart = runCatching { current.content as? Multipart }.getOrNull() ?: return null
+    val count = runCatching { multipart.count }.getOrDefault(0)
+    if (childIndex !in 0 until count) return null
+    current = runCatching { multipart.getBodyPart(childIndex) }.getOrNull() ?: return null
+  }
+  return current
+}
+
+internal fun readBoundedPartBytes(part: Part, maxBytes: Int = MAX_ATTACHMENT_DOWNLOAD_BYTES): ByteArray {
+  val out = ByteArrayOutputStream()
+  part.inputStream.use { input ->
+    val buffer = ByteArray(16_384)
+    var total = 0
+    while (true) {
+      val read = input.read(buffer)
+      if (read < 0) break
+      total += read
+      if (total > maxBytes) {
+        throw IllegalStateException("Attachment exceeds maximum allowed size of ${maxBytes / (1024 * 1024)} MB.")
+      }
+      out.write(buffer, 0, read)
+    }
+  }
+  return out.toByteArray()
+}
+
+private class InMemoryDataSource(
+  private val bytes: ByteArray,
+  private val contentTypeValue: String,
+  private val fileName: String,
+) : DataSource {
+  override fun getInputStream(): InputStream = ByteArrayInputStream(bytes)
+  override fun getOutputStream(): OutputStream =
+    throw UnsupportedOperationException("Read-only attachment data source")
+  override fun getContentType(): String = contentTypeValue
+  override fun getName(): String = fileName
+}
+
+internal fun buildOutgoingMimeMessage(
+  session: Session,
+  senderEmail: String,
+  senderName: String,
+  draft: OutgoingEmailDraft,
+): MimeMessage {
+  val totalAttachmentBytes = draft.attachments.sumOf { it.bytes.size.toLong() }
+  require(totalAttachmentBytes <= MAX_OUTGOING_ATTACHMENTS_BYTES) {
+    "Total attachment size cannot exceed ${MAX_OUTGOING_ATTACHMENTS_BYTES / (1024L * 1024L)} MB."
+  }
+
+  return MimeMessage(session).apply {
+    setFrom(
+      InternetAddress(
+        senderEmail,
+        senderName,
+        "UTF-8",
+      ),
+    )
+    setRecipients(
+      Message.RecipientType.TO,
+      InternetAddress.parse(sanitizeHeaderControlChars(draft.to), false),
+    )
+    val cleanCc = sanitizeHeaderControlChars(draft.cc)
+    if (cleanCc.isNotBlank()) {
+      setRecipients(
+        Message.RecipientType.CC,
+        InternetAddress.parse(cleanCc, false),
+      )
+    }
+    setSubject(sanitizeHeaderControlChars(draft.subject), "UTF-8")
+    sentDate = Date()
+
+    val safeInReplyTo = sanitizeSingleMessageId(draft.inReplyToMessageId)
+    if (safeInReplyTo != null) {
+      setHeader("In-Reply-To", safeInReplyTo)
+    }
+    val safeReferences = sanitizeReferencesHeader(draft.referencesHeader)
+    if (safeReferences != null) {
+      setHeader("References", safeReferences)
+    }
+
+    if (draft.attachments.isEmpty()) {
+      setText(draft.body, "UTF-8")
+    } else {
+      val multipart = MimeMultipart("mixed")
+      val textPart = MimeBodyPart().apply {
+        setText(draft.body, "UTF-8")
+      }
+      multipart.addBodyPart(textPart)
+
+      draft.attachments.forEachIndexed { idx, attachment ->
+        val safeName = sanitizeAttachmentFileName(
+          attachment.fileName,
+          fallback = "attachment-${idx + 1}",
+        )
+        val encodedFileName = runCatching {
+          MimeUtility.encodeText(safeName, "UTF-8", null)
+        }.getOrDefault(safeName)
+        val safeMime = sanitizeHeaderControlChars(attachment.mimeType)
+          .substringBefore(';')
+          .trim()
+          .lowercase(Locale.US)
+          .takeIf { it.contains('/') }
+          ?: "application/octet-stream"
+        val filePart = MimeBodyPart().apply {
+          dataHandler = DataHandler(
+            InMemoryDataSource(
+              bytes = attachment.bytes,
+              contentTypeValue = safeMime,
+              fileName = safeName,
+            ),
+          )
+          disposition = Part.ATTACHMENT
+          fileName = encodedFileName
+        }
+        multipart.addBodyPart(filePart)
+      }
+      setContent(multipart)
     }
   }
 }
@@ -392,6 +571,12 @@ interface MailClient {
     maxSearchDays: Int = 2,
   ): Result<List<EmailSummary>>
   suspend fun fetchMessageDetail(account: EmailAccount, uid: Long): Result<EmailDetail>
+  suspend fun downloadAttachment(
+    account: EmailAccount,
+    uid: Long,
+    partId: String,
+  ): Result<ByteArray> =
+    Result.failure(UnsupportedOperationException("Attachments are not supported by this mail client."))
   suspend fun prefetchMessages(account: EmailAccount, uids: List<Long>): Map<Long, EmailDetail> = emptyMap()
   suspend fun markMessageRead(account: EmailAccount, uid: Long): Result<Unit> = Result.success(Unit)
   suspend fun sendEmail(draft: OutgoingEmailDraft): Result<Unit>
@@ -529,6 +714,30 @@ class ImapSmtpMailClient(
     }
   }
 
+  override suspend fun downloadAttachment(
+    account: EmailAccount,
+    uid: Long,
+    partId: String,
+  ): Result<ByteArray> = withContext(Dispatchers.IO) {
+    runCatching {
+      openImapStore(account).use { store ->
+        val folder = store.getFolder(INBOX_FOLDER)
+        val uidFolder = folder as? UIDFolder
+          ?: throw IllegalStateException("IMAP server does not support UID access.")
+        folder.open(Folder.READ_ONLY)
+        try {
+          val message = uidFolder.getMessageByUID(uid)
+            ?: throw IllegalStateException("Email message #$uid could not be found.")
+          val targetPart = findMimePartByPath(message, partId)
+            ?: throw IllegalStateException("Attachment part $partId could not be found.")
+          readBoundedPartBytes(targetPart, MAX_ATTACHMENT_DOWNLOAD_BYTES)
+        } finally {
+          runCatching { folder.close(false) }
+        }
+      }
+    }
+  }
+
   override suspend fun prefetchMessages(
     account: EmailAccount,
     uids: List<Long>,
@@ -601,39 +810,12 @@ class ImapSmtpMailClient(
           },
         )
 
-        val mimeMessage = MimeMessage(session).apply {
-          setFrom(
-            InternetAddress(
-              senderEmail,
-              senderName,
-              "UTF-8",
-            ),
-          )
-          setRecipients(
-            Message.RecipientType.TO,
-            InternetAddress.parse(sanitizeHeaderControlChars(draft.to), false),
-          )
-          val cleanCc = sanitizeHeaderControlChars(draft.cc)
-          if (cleanCc.isNotBlank()) {
-            setRecipients(
-              Message.RecipientType.CC,
-              InternetAddress.parse(cleanCc, false),
-            )
-          }
-          setSubject(sanitizeHeaderControlChars(draft.subject), "UTF-8")
-          sentDate = Date()
-
-          val safeInReplyTo = sanitizeSingleMessageId(draft.inReplyToMessageId)
-          if (safeInReplyTo != null) {
-            setHeader("In-Reply-To", safeInReplyTo)
-          }
-          val safeReferences = sanitizeReferencesHeader(draft.referencesHeader)
-          if (safeReferences != null) {
-            setHeader("References", safeReferences)
-          }
-
-          setText(draft.body, "UTF-8")
-        }
+        val mimeMessage = buildOutgoingMimeMessage(
+          session = session,
+          senderEmail = senderEmail,
+          senderName = senderName,
+          draft = draft,
+        )
 
         Transport.send(mimeMessage)
       }
@@ -772,6 +954,7 @@ class ImapSmtpMailClient(
       add(FetchProfile.Item.FLAGS)
       add(UIDFolder.FetchProfileItem.UID)
       add("Message-ID")
+      add("Content-Type")
     }
     folder.fetch(messages, profile)
   }
@@ -807,7 +990,10 @@ class ImapSmtpMailClient(
     val replyTo = summary.replyToAddress ?: summary.fromAddress
 
     return EmailDetail(
-      summary = if (markSummaryRead) summary.copy(isUnread = false) else summary,
+      summary = summary.copy(
+        isUnread = if (markSummaryRead) false else summary.isUnread,
+        hasAttachments = extractedBody.attachments.isNotEmpty(),
+      ),
       toAddresses = toList,
       ccAddresses = ccList,
       replyToAddress = replyTo,
@@ -815,6 +1001,7 @@ class ImapSmtpMailClient(
       referencesHeader = sanitizeReferencesHeader(getHeader("References")?.firstOrNull()),
       plainTextBody = extractedBody.plainText?.trim(),
       htmlBody = extractedBody.htmlText?.trim(),
+      attachments = extractedBody.attachments.toList(),
     )
   }
 
@@ -894,6 +1081,10 @@ class ImapSmtpMailClient(
     val timestamp = (receivedDate ?: sentDate)?.time ?: 0L
     val unread = !flags.contains(Flags.Flag.SEEN)
     val flagged = flags.contains(Flags.Flag.FLAGGED)
+    val contentTypeHeader = runCatching {
+      getHeader("Content-Type")?.firstOrNull()?.lowercase(Locale.US)
+    }.getOrNull().orEmpty()
+    val hasMixedAttachmentHint = contentTypeHeader.contains("multipart/mixed")
 
     return EmailSummary(
       uid = uid,
@@ -908,6 +1099,7 @@ class ImapSmtpMailClient(
       isUnread = unread,
       isFlagged = flagged,
       replyToAddress = replyToEmail,
+      hasAttachments = hasMixedAttachmentHint,
     )
   }
 

@@ -1,6 +1,8 @@
 package dev.hm02.mail.ui.main
 
+import android.content.ContentResolver
 import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -12,10 +14,15 @@ import dev.hm02.mail.data.MicrosoftLoopbackOAuthServer
 import dev.hm02.mail.data.MicrosoftOAuthHelper
 import dev.hm02.mail.data.PendingMicrosoftOAuthSession
 import dev.hm02.mail.data.SettingsAndContactsStore
+import dev.hm02.mail.data.computeDayWindowStartMillis
+import dev.hm02.mail.data.parseQuickDaySearchDays
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import dev.hm02.mail.model.ComposeMode
 import dev.hm02.mail.model.ContactSuggestion
 import dev.hm02.mail.model.EmailAccount
+import dev.hm02.mail.model.EmailAttachment
 import dev.hm02.mail.model.EmailDetail
 import dev.hm02.mail.model.EmailSummary
 import dev.hm02.mail.model.MailAuthType
@@ -33,6 +40,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.Collections
@@ -103,6 +111,72 @@ internal fun parseMailtoUri(rawUri: String): MailtoDraftFields? {
   )
 }
 
+internal fun mergeDayWindowSummaries(
+  existing: List<EmailSummary>,
+  incoming: List<EmailSummary>,
+  flaggedKeys: Set<String> = emptySet(),
+  attachmentOverrides: Map<String, Boolean> = emptyMap(),
+  authoritativeWindowStartMillis: Long? = null,
+  maxItems: Int = 200,
+): List<EmailSummary> {
+  val byKey = LinkedHashMap<String, EmailSummary>(existing.size + incoming.size)
+  for (item in existing) {
+    if (authoritativeWindowStartMillis == null || item.receivedAtEpochMillis < authoritativeWindowStartMillis) {
+      byKey[item.compositeKey] = item
+    }
+  }
+  val existingByKey = existing.associateBy { it.compositeKey }
+  for (item in incoming) {
+    val prev = existingByKey[item.compositeKey]
+    val knownHasAttachment = attachmentOverrides[item.compositeKey]
+      ?: (item.hasAttachments || (prev?.hasAttachments == true))
+    byKey[item.compositeKey] = item.copy(
+      isFlagged = item.isFlagged || item.compositeKey in flaggedKeys,
+      hasAttachments = knownHasAttachment,
+    )
+  }
+  return byKey.values
+    .sortedByDescending { it.receivedAtEpochMillis }
+    .take(maxItems)
+}
+
+internal fun buildLocalQuickDaySearchResults(
+  quickDays: Int,
+  dayWindowItems: List<EmailSummary>,
+  feedItems: List<EmailSummary>,
+  flaggedItems: List<EmailSummary>,
+  attachmentOverrides: Map<String, Boolean> = emptyMap(),
+  nowMillis: Long = System.currentTimeMillis(),
+): List<EmailSummary> {
+  val windowStartMillis = computeDayWindowStartMillis(quickDays, nowMillis = nowMillis)
+  val flaggedKeys = flaggedItems.map { it.compositeKey }.toSet()
+  val combined = LinkedHashMap<String, EmailSummary>()
+  for (item in dayWindowItems) {
+    combined[item.compositeKey] = item
+  }
+  for (item in feedItems) {
+    val prev = combined[item.compositeKey]
+    combined[item.compositeKey] = item.copy(
+      hasAttachments = item.hasAttachments || (prev?.hasAttachments == true),
+    )
+  }
+  for (item in flaggedItems) {
+    val existing = combined[item.compositeKey]
+    combined[item.compositeKey] = (existing ?: item).copy(isFlagged = true)
+  }
+  return combined.values
+    .asSequence()
+    .filter { it.receivedAtEpochMillis >= windowStartMillis }
+    .map { item ->
+      item.copy(
+        isFlagged = item.isFlagged || item.compositeKey in flaggedKeys,
+        hasAttachments = attachmentOverrides[item.compositeKey] ?: item.hasAttachments,
+      )
+    }
+    .sortedByDescending { it.receivedAtEpochMillis }
+    .toList()
+}
+
 sealed interface ActivePane {
   data object Feed : ActivePane
   data class SearchResults(val query: String) : ActivePane
@@ -142,6 +216,7 @@ data class HM02UiState(
   val isRefreshingFeed: Boolean = false,
   val isSearching: Boolean = false,
   val isSendingEmail: Boolean = false,
+  val downloadingAttachmentPartId: String? = null,
   val isVerifyingAccount: Boolean = false,
   val isAwaitingMicrosoftOAuth: Boolean = false,
   val accountSetupError: String? = null,
@@ -167,7 +242,38 @@ class HM02ViewModel(
 
   private val handledOAuthCodes: MutableSet<String> = Collections.synchronizedSet(HashSet())
 
+  private data class CachedSearchEntry(
+    val items: List<EmailSummary>,
+    val cachedAtMillis: Long,
+  )
+
   private var latestSyncedFeedItems: List<EmailSummary> = emptyList()
+
+  @Volatile
+  private var cachedDayWindowItems: List<EmailSummary> = emptyList()
+
+  @Volatile
+  private var cachedDayWindowSyncedAtMillis: Long = 0L
+
+  @Volatile
+  private var cachedDayWindowMaxDaysCovered: Int = 0
+
+  @Volatile
+  private var activeSearchJob: Job? = null
+
+  @Volatile
+  private var activeDayWindowWarmJob: Job? = null
+
+  private val searchResultsCache: MutableMap<String, CachedSearchEntry> =
+    Collections.synchronizedMap(HashMap())
+
+  private val attachmentBytesCache: MutableMap<String, ByteArray> =
+    Collections.synchronizedMap(
+      object : LinkedHashMap<String, ByteArray>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean =
+          size > MAX_CACHED_ATTACHMENT_BLOBS
+      },
+    )
 
   private val messageDetailCache: MutableMap<String, EmailDetail> =
     Collections.synchronizedMap(
@@ -240,6 +346,47 @@ class HM02ViewModel(
         }
       }
     }
+    hydrateDiskCachesOnLaunch()
+  }
+
+  private fun hydrateDiskCachesOnLaunch() {
+    viewModelScope.launch {
+      val hydrated = withContext(Dispatchers.IO) {
+        Triple(
+          settingsAndContactsStore.loadCachedFeedSummaries(),
+          settingsAndContactsStore.loadCachedDayWindowSummaries(),
+          settingsAndContactsStore.loadCachedEmailDetails(),
+        )
+      }
+      val (cachedFeed, cachedDayWindow, cachedDetails) = hydrated
+      synchronized(messageDetailCache) {
+        for (detail in cachedDetails) {
+          val key = detail.summary.compositeKey
+          if (!messageDetailCache.containsKey(key)) {
+            messageDetailCache[key] = detail
+          }
+        }
+      }
+      if (cachedDayWindowItems.isEmpty() && cachedDayWindow.items.isNotEmpty()) {
+        cachedDayWindowItems = applyKnownAttachmentStates(cachedDayWindow.items)
+        cachedDayWindowSyncedAtMillis = cachedDayWindow.syncedAtEpochMillis
+        cachedDayWindowMaxDaysCovered = cachedDayWindow.maxDaysCovered
+      }
+      if (latestSyncedFeedItems.isEmpty() && cachedFeed.isNotEmpty() && accountStore.accounts.value.isNotEmpty()) {
+        latestSyncedFeedItems = applyKnownAttachmentStates(cachedFeed)
+        _uiState.update { state ->
+          state.copy(
+            feedItems = mergeFeedWithFlagged(
+              syncedItems = latestSyncedFeedItems,
+              flaggedItems = settingsAndContactsStore.flaggedEmails.value,
+              enablePinToFeed = state.settings.enablePinToFeed,
+            ),
+            lastRefreshedAtMillis = state.lastRefreshedAtMillis
+              ?: cachedDayWindow.syncedAtEpochMillis.takeIf { it > 0L },
+          )
+        }
+      }
+    }
   }
 
   fun updatePolicyConfig(newConfig: MailPolicyConfig) {
@@ -287,8 +434,26 @@ class HM02ViewModel(
     viewModelScope.launch {
       _uiState.update { it.copy(isRefreshingFeed = true) }
       val syncResult = mailClient.fetchFeed(accounts, activeConfig)
-      latestSyncedFeedItems = syncResult.items
       val failures = syncResult.failedAccounts
+      val allFailed = failures.size == accounts.size && syncResult.items.isEmpty()
+      if (!allFailed) {
+        latestSyncedFeedItems = applyKnownAttachmentStates(syncResult.items)
+        val flaggedKeys = settingsAndContactsStore.flaggedEmails.value
+          .map { it.compositeKey }
+          .toSet()
+        cachedDayWindowItems = mergeDayWindowSummaries(
+          existing = cachedDayWindowItems,
+          incoming = latestSyncedFeedItems,
+          flaggedKeys = flaggedKeys,
+          attachmentOverrides = knownAttachmentOverrides(),
+          maxItems = MAX_CACHED_DAY_WINDOW_ITEMS,
+        )
+        val feedToPersist = latestSyncedFeedItems
+        viewModelScope.launch(Dispatchers.IO) {
+          runCatching { settingsAndContactsStore.saveCachedFeedSummaries(feedToPersist) }
+        }
+      }
+
       val errorNotice = when {
         failures.isEmpty() -> null
         failures.size == accounts.size ->
@@ -305,19 +470,92 @@ class HM02ViewModel(
 
       _uiState.update { state ->
         state.copy(
-          feedItems = mergeFeedWithFlagged(
-            syncedItems = latestSyncedFeedItems,
-            flaggedItems = settingsAndContactsStore.flaggedEmails.value,
-            enablePinToFeed = state.settings.enablePinToFeed,
-          ),
+          feedItems = mergedFeed,
           failedAccountSyncs = failures,
           isRefreshingFeed = false,
-          lastRefreshedAtMillis = System.currentTimeMillis(),
+          lastRefreshedAtMillis = if (allFailed) state.lastRefreshedAtMillis else System.currentTimeMillis(),
           statusMessage = errorNotice ?: state.statusMessage,
         )
       }
 
       prefetchSummariesInBackground(mergedFeed)
+      warmDayWindowCacheInBackground(accounts, activeConfig.maxSearchDays)
+    }
+  }
+
+  private fun warmDayWindowCacheInBackground(
+    accounts: List<EmailAccount>,
+    maxSearchDays: Int,
+  ) {
+    if (maxSearchDays <= 0 || accounts.isEmpty()) return
+    val now = System.currentTimeMillis()
+    if (
+      cachedDayWindowItems.isNotEmpty() &&
+      cachedDayWindowMaxDaysCovered >= maxSearchDays &&
+      (now - cachedDayWindowSyncedAtMillis) < DAY_WINDOW_WARM_INTERVAL_MS
+    ) {
+      return
+    }
+    if (activeDayWindowWarmJob?.isActive == true) return
+
+    activeDayWindowWarmJob = viewModelScope.launch {
+      val warmQuery = if (maxSearchDays >= 2) "a$maxSearchDays" else "a"
+      val warmResult = mailClient.searchMessages(
+        accounts = accounts,
+        query = warmQuery,
+        maxPerAccount = MAX_DAY_WINDOW_SEARCH_PER_ACCOUNT,
+        maxSearchDays = maxSearchDays,
+      )
+      warmResult.onSuccess { items ->
+        val syncedAt = System.currentTimeMillis()
+        val flaggedItems = settingsAndContactsStore.flaggedEmails.value
+        val flaggedKeys = flaggedItems.map { it.compositeKey }.toSet()
+        val overrides = knownAttachmentOverrides()
+        val windowStart = computeDayWindowStartMillis(maxSearchDays, nowMillis = syncedAt)
+        val merged = mergeDayWindowSummaries(
+          existing = cachedDayWindowItems,
+          incoming = items,
+          flaggedKeys = flaggedKeys,
+          attachmentOverrides = overrides,
+          authoritativeWindowStartMillis = windowStart,
+          maxItems = MAX_CACHED_DAY_WINDOW_ITEMS,
+        )
+        cachedDayWindowItems = merged
+        cachedDayWindowSyncedAtMillis = syncedAt
+        cachedDayWindowMaxDaysCovered = maxSearchDays
+        viewModelScope.launch(Dispatchers.IO) {
+          runCatching {
+            settingsAndContactsStore.saveCachedDayWindowSummaries(
+              items = merged,
+              syncedAtEpochMillis = syncedAt,
+              maxDaysCovered = maxSearchDays,
+            )
+          }
+        }
+        val activeSearch = _uiState.value.activePane as? ActivePane.SearchResults
+        val activeQuickDays = activeSearch?.let {
+          parseQuickDaySearchDays(it.query, maxDays = maxSearchDays)
+        }
+        if (activeQuickDays != null) {
+          val liveMatches = buildLocalQuickDaySearchResults(
+            quickDays = activeQuickDays,
+            dayWindowItems = merged,
+            feedItems = latestSyncedFeedItems,
+            flaggedItems = flaggedItems,
+            attachmentOverrides = overrides,
+            nowMillis = syncedAt,
+          )
+          _uiState.update { state ->
+            val currentPane = state.activePane as? ActivePane.SearchResults
+            if (currentPane?.query == activeSearch.query) {
+              state.copy(searchResults = liveMatches)
+            } else {
+              state
+            }
+          }
+        }
+        prefetchSummariesInBackground(merged.take(MAX_SEARCH_PREFETCH_ITEMS))
+      }
     }
   }
 
@@ -344,7 +582,11 @@ class HM02ViewModel(
     executeSearch()
   }
 
-  fun executeSearch() {
+  fun refreshSearch() {
+    executeSearch(forceRefresh = true)
+  }
+
+  fun executeSearch(forceRefresh: Boolean = false) {
     val query = _uiState.value.searchQuery.trim()
     val accounts = accountStore.accounts.value
     if (query.isEmpty()) {
@@ -356,28 +598,161 @@ class HM02ViewModel(
       return
     }
 
-    viewModelScope.launch {
+    activeSearchJob?.cancel()
+    val maxSearchDays = policyConfig.maxSearchDays
+    val quickDays = parseQuickDaySearchDays(query, maxDays = maxSearchDays)
+    val now = System.currentTimeMillis()
+    val flaggedItems = settingsAndContactsStore.flaggedEmails.value
+    val flaggedKeys = flaggedItems.map { it.compositeKey }.toSet()
+    val attachmentOverrides = knownAttachmentOverrides()
+
+    if (quickDays != null) {
+      val instantMatches = buildLocalQuickDaySearchResults(
+        quickDays = quickDays,
+        dayWindowItems = cachedDayWindowItems,
+        feedItems = latestSyncedFeedItems,
+        flaggedItems = flaggedItems,
+        attachmentOverrides = attachmentOverrides,
+        nowMillis = now,
+      )
+      val hasFreshDayCache = !forceRefresh &&
+        cachedDayWindowSyncedAtMillis > 0L &&
+        cachedDayWindowMaxDaysCovered >= quickDays &&
+        (now - cachedDayWindowSyncedAtMillis) < DAY_WINDOW_CACHE_FRESHNESS_MS
+
       _uiState.update {
         it.copy(
-          isSearching = true,
-          searchResults = emptyList(),
+          isSearching = !hasFreshDayCache,
+          searchResults = instantMatches,
           searchSuggestions = emptyList(),
           activePane = ActivePane.SearchResults(query),
           statusMessage = null,
         )
       }
+
+      if (hasFreshDayCache) {
+        prefetchSummariesInBackground(instantMatches.take(MAX_SEARCH_PREFETCH_ITEMS))
+        return
+      }
+
+      activeSearchJob = viewModelScope.launch {
+        val result = mailClient.searchMessages(
+          accounts = accounts,
+          query = query,
+          maxPerAccount = MAX_DAY_WINDOW_SEARCH_PER_ACCOUNT,
+          maxSearchDays = maxSearchDays,
+        )
+        result.fold(
+          onSuccess = { items ->
+            val syncedAt = System.currentTimeMillis()
+            val windowStart = computeDayWindowStartMillis(quickDays, nowMillis = syncedAt)
+            val currentFlaggedItems = settingsAndContactsStore.flaggedEmails.value
+            val currentFlaggedKeys = currentFlaggedItems.map { it.compositeKey }.toSet()
+            val currentOverrides = knownAttachmentOverrides()
+            val merged = mergeDayWindowSummaries(
+              existing = cachedDayWindowItems,
+              incoming = items,
+              flaggedKeys = currentFlaggedKeys,
+              attachmentOverrides = currentOverrides,
+              authoritativeWindowStartMillis = windowStart,
+              maxItems = MAX_CACHED_DAY_WINDOW_ITEMS,
+            )
+            cachedDayWindowItems = merged
+            cachedDayWindowSyncedAtMillis = syncedAt
+            cachedDayWindowMaxDaysCovered = maxOf(cachedDayWindowMaxDaysCovered, quickDays)
+            val coveredDays = cachedDayWindowMaxDaysCovered
+            viewModelScope.launch(Dispatchers.IO) {
+              runCatching {
+                settingsAndContactsStore.saveCachedDayWindowSummaries(
+                  items = merged,
+                  syncedAtEpochMillis = syncedAt,
+                  maxDaysCovered = coveredDays,
+                )
+              }
+            }
+            val updatedMatches = buildLocalQuickDaySearchResults(
+              quickDays = quickDays,
+              dayWindowItems = merged,
+              feedItems = emptyList(),
+              flaggedItems = currentFlaggedItems,
+              attachmentOverrides = currentOverrides,
+              nowMillis = syncedAt,
+            )
+            _uiState.update {
+              it.copy(
+                searchResults = updatedMatches,
+                isSearching = false,
+              )
+            }
+            prefetchSummariesInBackground(updatedMatches.take(MAX_SEARCH_PREFETCH_ITEMS))
+          },
+          onFailure = { error ->
+            _uiState.update {
+              it.copy(
+                isSearching = false,
+                statusMessage = if (instantMatches.isNotEmpty()) {
+                  "Showing cached emails (refresh failed: ${error.localizedMessage ?: "Offline"})"
+                } else {
+                  "Search failed: ${error.localizedMessage ?: "Unknown error"}"
+                },
+              )
+            }
+          },
+        )
+      }
+      return
+    }
+
+    val normalizedKey = query.lowercase(Locale.US)
+    val cachedEntry = synchronized(searchResultsCache) { searchResultsCache[normalizedKey] }
+    val cachedDecorated = cachedEntry?.items?.map { item ->
+      item.copy(
+        isFlagged = item.isFlagged || item.compositeKey in flaggedKeys,
+        hasAttachments = attachmentOverrides[item.compositeKey] ?: item.hasAttachments,
+      )
+    }.orEmpty()
+    val isGeneralCacheFresh = !forceRefresh &&
+      cachedEntry != null &&
+      (now - cachedEntry.cachedAtMillis) < GENERAL_SEARCH_CACHE_FRESHNESS_MS
+
+    _uiState.update {
+      it.copy(
+        isSearching = !isGeneralCacheFresh,
+        searchResults = cachedDecorated,
+        searchSuggestions = emptyList(),
+        activePane = ActivePane.SearchResults(query),
+        statusMessage = null,
+      )
+    }
+
+    if (isGeneralCacheFresh) {
+      prefetchSummariesInBackground(cachedDecorated.take(MAX_SEARCH_PREFETCH_ITEMS))
+      return
+    }
+
+    activeSearchJob = viewModelScope.launch {
       val result = mailClient.searchMessages(
         accounts = accounts,
         query = query,
-        maxSearchDays = policyConfig.maxSearchDays,
+        maxSearchDays = maxSearchDays,
       )
       result.fold(
         onSuccess = { items ->
-          val flaggedKeys = settingsAndContactsStore.flaggedEmails.value
+          val currentFlaggedKeys = settingsAndContactsStore.flaggedEmails.value
             .map { it.compositeKey }
             .toSet()
+          val currentOverrides = knownAttachmentOverrides()
           val decoratedItems = items.map { item ->
-            item.copy(isFlagged = item.isFlagged || item.compositeKey in flaggedKeys)
+            item.copy(
+              isFlagged = item.isFlagged || item.compositeKey in currentFlaggedKeys,
+              hasAttachments = currentOverrides[item.compositeKey] ?: item.hasAttachments,
+            )
+          }
+          synchronized(searchResultsCache) {
+            searchResultsCache[normalizedKey] = CachedSearchEntry(
+              items = decoratedItems,
+              cachedAtMillis = System.currentTimeMillis(),
+            )
           }
           _uiState.update {
             it.copy(
@@ -391,7 +766,11 @@ class HM02ViewModel(
           _uiState.update {
             it.copy(
               isSearching = false,
-              statusMessage = "Search failed: ${error.localizedMessage ?: "Unknown error"}",
+              statusMessage = if (cachedDecorated.isNotEmpty()) {
+                "Showing cached search results (refresh failed: ${error.localizedMessage ?: "Offline"})"
+              } else {
+                "Search failed: ${error.localizedMessage ?: "Unknown error"}"
+              },
             )
           }
         },
@@ -559,11 +938,27 @@ class HM02ViewModel(
     val cachedDetail = messageDetailCache[summary.compositeKey]
     if (cachedDetail != null) {
       settingsAndContactsStore.markFlaggedEmailRead(summary.compositeKey)
+      val cachedHasAttachments = cachedDetail.attachments.isNotEmpty()
       latestSyncedFeedItems = latestSyncedFeedItems.map {
-        if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
+        if (it.compositeKey == summary.compositeKey) {
+          it.copy(isUnread = false, hasAttachments = cachedHasAttachments)
+        } else {
+          it
+        }
+      }
+      cachedDayWindowItems = cachedDayWindowItems.map {
+        if (it.compositeKey == summary.compositeKey) {
+          it.copy(isUnread = false, hasAttachments = cachedHasAttachments)
+        } else {
+          it
+        }
       }
       val flaggedNow = cachedDetail.summary.isFlagged || isCurrentlyFlagged
-      val updatedSummary = cachedDetail.summary.copy(isUnread = false, isFlagged = flaggedNow)
+      val updatedSummary = cachedDetail.summary.copy(
+        isUnread = false,
+        isFlagged = flaggedNow,
+        hasAttachments = cachedHasAttachments,
+      )
       val updatedDetail = cachedDetail.copy(summary = updatedSummary)
       messageDetailCache[summary.compositeKey] = updatedDetail
 
@@ -575,7 +970,11 @@ class HM02ViewModel(
             enablePinToFeed = state.settings.enablePinToFeed,
           ),
           searchResults = state.searchResults.map {
-            if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
+            if (it.compositeKey == summary.compositeKey) {
+              it.copy(isUnread = false, hasAttachments = cachedHasAttachments)
+            } else {
+              it
+            }
           },
           activePane = ActivePane.Reader(
             summary = updatedSummary,
@@ -611,13 +1010,30 @@ class HM02ViewModel(
       result.fold(
         onSuccess = { detail ->
           settingsAndContactsStore.markFlaggedEmailRead(summary.compositeKey)
+          val hasAttachmentsNow = detail.attachments.isNotEmpty()
           latestSyncedFeedItems = latestSyncedFeedItems.map {
-            if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
+            if (it.compositeKey == summary.compositeKey) {
+              it.copy(isUnread = false, hasAttachments = hasAttachmentsNow)
+            } else {
+              it
+            }
+          }
+          cachedDayWindowItems = cachedDayWindowItems.map {
+            if (it.compositeKey == summary.compositeKey) {
+              it.copy(isUnread = false, hasAttachments = hasAttachmentsNow)
+            } else {
+              it
+            }
           }
           val flaggedNow = detail.summary.isFlagged || settingsAndContactsStore.isEmailFlagged(summary.compositeKey)
-          val updatedSummary = detail.summary.copy(isUnread = false, isFlagged = flaggedNow)
+          val updatedSummary = detail.summary.copy(
+            isUnread = false,
+            isFlagged = flaggedNow,
+            hasAttachments = hasAttachmentsNow,
+          )
           val updatedDetail = detail.copy(summary = updatedSummary)
           messageDetailCache[summary.compositeKey] = updatedDetail
+          persistDetailCacheAsync()
 
           _uiState.update { state ->
             state.copy(
@@ -627,7 +1043,11 @@ class HM02ViewModel(
                 enablePinToFeed = state.settings.enablePinToFeed,
               ),
               searchResults = state.searchResults.map {
-                if (it.compositeKey == summary.compositeKey) it.copy(isUnread = false) else it
+                if (it.compositeKey == summary.compositeKey) {
+                  it.copy(isUnread = false, hasAttachments = hasAttachmentsNow)
+                } else {
+                  it
+                }
               },
               activePane = ActivePane.Reader(
                 summary = updatedSummary,
@@ -1175,6 +1595,25 @@ class HM02ViewModel(
     synchronized(messageDetailCache) {
       messageDetailCache.keys.removeAll { it.startsWith("$accountId:") }
     }
+    synchronized(attachmentBytesCache) {
+      attachmentBytesCache.keys.removeAll { it.startsWith("$accountId:") }
+    }
+    synchronized(searchResultsCache) {
+      searchResultsCache.clear()
+    }
+    cachedDayWindowItems = cachedDayWindowItems.filterNot { it.accountId == accountId }
+    latestSyncedFeedItems = latestSyncedFeedItems.filterNot { it.accountId == accountId }
+    viewModelScope.launch(Dispatchers.IO) {
+      runCatching {
+        settingsAndContactsStore.saveCachedDayWindowSummaries(
+          items = cachedDayWindowItems,
+          syncedAtEpochMillis = cachedDayWindowSyncedAtMillis,
+          maxDaysCovered = cachedDayWindowMaxDaysCovered,
+        )
+        settingsAndContactsStore.saveCachedFeedSummaries(latestSyncedFeedItems)
+      }
+    }
+    persistDetailCacheAsync()
     _uiState.update { state ->
       state.copy(
         searchResults = state.searchResults.filterNot { it.accountId == accountId },
@@ -1187,6 +1626,94 @@ class HM02ViewModel(
     _uiState.update { it.copy(statusMessage = null) }
   }
 
+  fun reportStatusMessage(message: String) {
+    _uiState.update { it.copy(statusMessage = message) }
+  }
+
+  fun saveAttachmentToUri(
+    detail: EmailDetail,
+    attachment: EmailAttachment,
+    contentResolver: ContentResolver,
+    targetUri: Uri,
+  ) {
+    val account = accountStore.accounts.value.find { it.id == detail.summary.accountId }
+    if (account == null) {
+      _uiState.update { it.copy(statusMessage = "Account not found for attachment download.") }
+      return
+    }
+    viewModelScope.launch {
+      _uiState.update {
+        it.copy(
+          downloadingAttachmentPartId = attachment.partId,
+          statusMessage = null,
+        )
+      }
+      val cacheKey = "${detail.summary.compositeKey}:${attachment.partId}"
+      val saveResult = withContext(Dispatchers.IO) {
+        runCatching {
+          val bytes = synchronized(attachmentBytesCache) { attachmentBytesCache[cacheKey] }
+            ?: mailClient.downloadAttachment(account, detail.summary.uid, attachment.partId)
+              .getOrThrow()
+              .also { fetched ->
+                if (fetched.size <= MAX_IN_MEMORY_ATTACHMENT_BYTES) {
+                  synchronized(attachmentBytesCache) {
+                    attachmentBytesCache[cacheKey] = fetched
+                  }
+                }
+              }
+          contentResolver.openOutputStream(targetUri)?.use { output ->
+            output.write(bytes)
+          } ?: throw IllegalStateException("Could not open destination file for writing.")
+        }
+      }
+      saveResult.fold(
+        onSuccess = {
+          _uiState.update {
+            it.copy(
+              downloadingAttachmentPartId = null,
+              statusMessage = "Saved ${attachment.fileName}",
+            )
+          }
+        },
+        onFailure = { error ->
+          _uiState.update {
+            it.copy(
+              downloadingAttachmentPartId = null,
+              statusMessage = "Failed to save ${attachment.fileName}: ${error.localizedMessage ?: "Download error"}",
+            )
+          }
+        },
+      )
+    }
+  }
+
+  private fun knownAttachmentOverrides(): Map<String, Boolean> =
+    synchronized(messageDetailCache) {
+      messageDetailCache.mapValues { (_, detail) -> detail.attachments.isNotEmpty() }
+    }
+
+  private fun applyKnownAttachmentStates(items: List<EmailSummary>): List<EmailSummary> {
+    val overrides = knownAttachmentOverrides()
+    if (overrides.isEmpty()) return items
+    return items.map { item ->
+      val override = overrides[item.compositeKey]
+      if (override != null && override != item.hasAttachments) {
+        item.copy(hasAttachments = override)
+      } else {
+        item
+      }
+    }
+  }
+
+  private fun persistDetailCacheAsync() {
+    val snapshot = synchronized(messageDetailCache) { messageDetailCache.values.toList() }
+    viewModelScope.launch(Dispatchers.IO) {
+      runCatching {
+        settingsAndContactsStore.saveCachedEmailDetails(snapshot)
+      }
+    }
+  }
+
   private fun prefetchSummariesInBackground(items: List<EmailSummary>) {
     val uncached = items.filter { !messageDetailCache.containsKey(it.compositeKey) }
     if (uncached.isEmpty()) return
@@ -1195,22 +1722,44 @@ class HM02ViewModel(
     val groupedByAccount = uncached.groupBy { it.accountId }
 
     viewModelScope.launch {
+      var anyPrefetched = false
       coroutineScope {
         groupedByAccount.mapNotNull { (accountId, accountSummaries) ->
           val account = accountsById[accountId] ?: return@mapNotNull null
           val uids = accountSummaries.map { it.uid }.distinct().take(MAX_PREFETCH_PER_ACCOUNT)
           async {
             val prefetched = mailClient.prefetchMessages(account, uids)
+            if (prefetched.isNotEmpty()) {
+              anyPrefetched = true
+            }
             for ((uid, detail) in prefetched) {
               val key = "$accountId:$uid"
               val isFlagged = detail.summary.isFlagged || settingsAndContactsStore.isEmailFlagged(key)
               val hydratedDetail = detail.copy(
-                summary = detail.summary.copy(isFlagged = isFlagged),
+                summary = detail.summary.copy(
+                  isFlagged = isFlagged,
+                  hasAttachments = detail.attachments.isNotEmpty(),
+                ),
               )
               messageDetailCache[key] = hydratedDetail
             }
           }
         }.awaitAll()
+      }
+      if (anyPrefetched) {
+        latestSyncedFeedItems = applyKnownAttachmentStates(latestSyncedFeedItems)
+        cachedDayWindowItems = applyKnownAttachmentStates(cachedDayWindowItems)
+        _uiState.update { state ->
+          state.copy(
+            feedItems = mergeFeedWithFlagged(
+              syncedItems = latestSyncedFeedItems,
+              flaggedItems = settingsAndContactsStore.flaggedEmails.value,
+              enablePinToFeed = state.settings.enablePinToFeed,
+            ),
+            searchResults = applyKnownAttachmentStates(state.searchResults),
+          )
+        }
+        persistDetailCacheAsync()
       }
     }
   }
@@ -1261,8 +1810,15 @@ class HM02ViewModel(
 
   companion object {
     private const val MAX_CACHED_EMAIL_DETAILS = 100
+    private const val MAX_CACHED_DAY_WINDOW_ITEMS = 200
+    private const val MAX_DAY_WINDOW_SEARCH_PER_ACCOUNT = 100
     private const val MAX_PREFETCH_PER_ACCOUNT = 20
     private const val MAX_SEARCH_PREFETCH_ITEMS = 15
+    private const val MAX_CACHED_ATTACHMENT_BLOBS = 6
+    private const val MAX_IN_MEMORY_ATTACHMENT_BYTES = 5 * 1024 * 1024
+    internal const val DAY_WINDOW_CACHE_FRESHNESS_MS = 90_000L
+    private const val DAY_WINDOW_WARM_INTERVAL_MS = 120_000L
+    private const val GENERAL_SEARCH_CACHE_FRESHNESS_MS = 90_000L
 
     fun provideFactory(
       context: Context,

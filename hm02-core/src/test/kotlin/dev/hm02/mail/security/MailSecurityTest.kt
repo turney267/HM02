@@ -1,23 +1,36 @@
 package dev.hm02.mail.security
 
+import dev.hm02.mail.data.CachedDayWindowSummaries
 import dev.hm02.mail.data.ExtractedBody
 import dev.hm02.mail.data.MAX_MIME_PARTS
+import dev.hm02.mail.data.MAX_OUTGOING_ATTACHMENTS_BYTES
 import dev.hm02.mail.data.MAX_TEXT_BODY_BYTES
 import dev.hm02.mail.data.MicrosoftOAuthHelper
 import dev.hm02.mail.data.buildImapProperties
+import dev.hm02.mail.data.buildOutgoingMimeMessage
 import dev.hm02.mail.data.buildSmtpProperties
+import dev.hm02.mail.data.computeDayWindowStartMillis
 import dev.hm02.mail.data.extractMimeContent
+import dev.hm02.mail.data.findMimePartByPath
 import dev.hm02.mail.data.normalizePassword
 import dev.hm02.mail.data.parseQuickDaySearchDays
+import dev.hm02.mail.data.readBoundedPartBytes
 import dev.hm02.mail.data.sanitizeReferencesHeader
 import dev.hm02.mail.data.sanitizeSingleMessageId
 import dev.hm02.mail.data.validateMailServerEndpoint
 import dev.hm02.mail.model.ContactSuggestion
+import dev.hm02.mail.model.DraftAttachment
 import dev.hm02.mail.model.EmailAccount
+import dev.hm02.mail.model.EmailAttachment
+import dev.hm02.mail.model.EmailDetail
+import dev.hm02.mail.model.EmailSummary
 import dev.hm02.mail.model.MailAuthType
 import dev.hm02.mail.model.MailProviderPreset
+import dev.hm02.mail.model.OutgoingEmailDraft
 import dev.hm02.mail.model.sanitizeHeaderControlChars
+import dev.hm02.mail.ui.main.buildLocalQuickDaySearchResults
 import dev.hm02.mail.ui.main.containsRemoteImages
+import dev.hm02.mail.ui.main.mergeDayWindowSummaries
 import dev.hm02.mail.ui.main.parseMailtoUri
 import dev.hm02.mail.ui.main.sanitizeAndWrapEmailHtml
 import dev.hm02.mail.ui.main.sanitizeEmailHtml
@@ -373,5 +386,233 @@ class MailSecurityTest {
     } finally {
       loopbackServer.close()
     }
+  }
+
+  @Test
+  fun `extractMimeContent preserves text and html bodies alongside nested and untagged attachments`() {
+    val session = Session.getInstance(Properties())
+    val altMultipart = MimeMultipart("alternative").apply {
+      addBodyPart(MimeBodyPart().apply { setText("Hello plain", "UTF-8") })
+      addBodyPart(MimeBodyPart().apply { setContent("<p>Hello HTML</p>", "text/html; charset=UTF-8") })
+    }
+    val altContainer = MimeBodyPart().apply { setContent(altMultipart) }
+
+    fun bytesDataSource(data: ByteArray, mime: String, name: String) =
+      object : javax.activation.DataSource {
+        override fun getInputStream() = java.io.ByteArrayInputStream(data)
+        override fun getOutputStream() = throw UnsupportedOperationException()
+        override fun getContentType() = mime
+        override fun getName() = name
+      }
+
+    val pdfBytes = "%PDF-1.7-test".encodeToByteArray()
+    val pdfPart = MimeBodyPart().apply {
+      dataHandler = javax.activation.DataHandler(bytesDataSource(pdfBytes, "application/pdf", "invoice 2026.pdf"))
+      disposition = javax.mail.Part.ATTACHMENT
+      fileName = "invoice 2026.pdf"
+    }
+
+    val pngBytes = byteArrayOf(1, 2, 3, 4, 5)
+    val pngPart = MimeBodyPart().apply {
+      dataHandler = javax.activation.DataHandler(bytesDataSource(pngBytes, "image/png", "photo.png"))
+      fileName = "photo.png"
+    }
+
+    val mixed = MimeMultipart("mixed").apply {
+      addBodyPart(altContainer)
+      addBodyPart(pdfPart)
+      addBodyPart(pngPart)
+    }
+    val rawBuf = java.io.ByteArrayOutputStream()
+    MimeMessage(session).apply {
+      setContent(mixed)
+      saveChanges()
+      writeTo(rawBuf)
+    }
+    val msg = MimeMessage(session, java.io.ByteArrayInputStream(rawBuf.toByteArray()))
+
+    val out = ExtractedBody()
+    extractMimeContent(msg, out)
+    assertEquals("Hello plain", out.plainText?.trim())
+    assertEquals("<p>Hello HTML</p>", out.htmlText?.trim())
+    assertEquals(2, out.attachments.size)
+    assertEquals("0.1", out.attachments[0].partId)
+    assertEquals("invoice 2026.pdf", out.attachments[0].fileName)
+    assertEquals("application/pdf", out.attachments[0].mimeType)
+    assertEquals("0.2", out.attachments[1].partId)
+    assertEquals("photo.png", out.attachments[1].fileName)
+    assertEquals("image/png", out.attachments[1].mimeType)
+
+    val foundPdf = findMimePartByPath(msg, "0.1")
+    val foundPng = findMimePartByPath(msg, "0.2")
+    assertNotNull(foundPdf)
+    assertNotNull(foundPng)
+    assertEquals(pdfBytes.toList(), readBoundedPartBytes(foundPdf!!).toList())
+    assertEquals(pngBytes.toList(), readBoundedPartBytes(foundPng!!).toList())
+  }
+
+  @Test
+  fun `buildOutgoingMimeMessage attaches files into multipart mixed and enforces 20MB limit`() {
+    val session = Session.getInstance(Properties())
+    val txtBytes = "hello attachment".encodeToByteArray()
+    val binBytes = byteArrayOf(9, 8, 7, 6)
+    val draft = OutgoingEmailDraft(
+      fromAccount = sampleAccount(),
+      to = "bob@example.com",
+      subject = "With attachments",
+      body = "Please see attached.",
+      attachments = listOf(
+        DraftAttachment(
+          fileName = "../notes.txt",
+          mimeType = "text/plain",
+          sizeBytes = txtBytes.size.toLong(),
+          bytes = txtBytes,
+        ),
+        DraftAttachment(
+          fileName = "data.bin",
+          mimeType = "application/octet-stream",
+          sizeBytes = binBytes.size.toLong(),
+          bytes = binBytes,
+        ),
+      ),
+    )
+
+    val composed = buildOutgoingMimeMessage(
+      session = session,
+      senderEmail = "alice@example.com",
+      senderName = "Alice",
+      draft = draft,
+    )
+    composed.saveChanges()
+
+    val extracted = ExtractedBody()
+    extractMimeContent(composed, extracted)
+    assertEquals("Please see attached.", extracted.plainText?.trim())
+    assertEquals(2, extracted.attachments.size)
+    assertEquals("__notes.txt", extracted.attachments[0].fileName)
+    assertEquals("data.bin", extracted.attachments[1].fileName)
+    assertEquals(txtBytes.toList(), readBoundedPartBytes(findMimePartByPath(composed, extracted.attachments[0].partId)!!).toList())
+    assertEquals(binBytes.toList(), readBoundedPartBytes(findMimePartByPath(composed, extracted.attachments[1].partId)!!).toList())
+
+    val oversizedDraft = draft.copy(
+      attachments = listOf(
+        DraftAttachment(
+          fileName = "huge.bin",
+          mimeType = "application/octet-stream",
+          sizeBytes = MAX_OUTGOING_ATTACHMENTS_BYTES + 1L,
+          bytes = ByteArray((MAX_OUTGOING_ATTACHMENTS_BYTES + 1L).toInt()),
+        ),
+      ),
+    )
+    assertThrows(IllegalArgumentException::class.java) {
+      buildOutgoingMimeMessage(session, "alice@example.com", "Alice", oversizedDraft)
+    }
+  }
+
+  @Test
+  fun `quick day search cache helpers filter a and a2 windows and preserve overrides`() {
+    val now = 1_760_000_000_000L
+    val todayStart = computeDayWindowStartMillis(1, nowMillis = now)
+    val twoDayStart = computeDayWindowStartMillis(2, nowMillis = now)
+
+    fun email(uid: Long, timestamp: Long, unread: Boolean = true) = EmailSummary(
+      uid = uid,
+      accountId = "acc1",
+      accountEmail = "alice@example.com",
+      accountDisplayName = "Alice",
+      subject = "Msg $uid",
+      fromName = "Sender",
+      fromAddress = "sender@example.com",
+      receivedAtEpochMillis = timestamp,
+      isUnread = unread,
+    )
+
+    val todayEmail = email(uid = 101L, timestamp = todayStart + 3_600_000L)
+    val todayStaleEmail = email(uid = 102L, timestamp = todayStart + 1_800_000L)
+    val yesterdayEmail = email(uid = 103L, timestamp = twoDayStart + 3_600_000L)
+    val olderEmail = email(uid = 104L, timestamp = twoDayStart - 3_600_000L)
+    val liveFeedEmail = email(uid = 105L, timestamp = todayStart + 7_200_000L)
+
+    val mergedAuthoritativeToday = mergeDayWindowSummaries(
+      existing = listOf(todayStaleEmail, yesterdayEmail),
+      incoming = listOf(todayEmail),
+      flaggedKeys = setOf(yesterdayEmail.compositeKey),
+      attachmentOverrides = mapOf(todayEmail.compositeKey to true),
+      authoritativeWindowStartMillis = todayStart,
+    )
+    assertEquals(listOf(101L, 103L), mergedAuthoritativeToday.map { it.uid })
+    assertTrue(mergedAuthoritativeToday.first().hasAttachments)
+
+    val a1Results = buildLocalQuickDaySearchResults(
+      quickDays = 1,
+      dayWindowItems = mergedAuthoritativeToday + olderEmail,
+      feedItems = listOf(liveFeedEmail),
+      flaggedItems = listOf(yesterdayEmail),
+      attachmentOverrides = mapOf(liveFeedEmail.compositeKey to true),
+      nowMillis = now,
+    )
+    assertEquals(listOf(105L, 101L), a1Results.map { it.uid })
+    assertTrue(a1Results.first().hasAttachments)
+
+    val a2Results = buildLocalQuickDaySearchResults(
+      quickDays = 2,
+      dayWindowItems = mergedAuthoritativeToday + olderEmail,
+      feedItems = listOf(liveFeedEmail),
+      flaggedItems = listOf(yesterdayEmail),
+      nowMillis = now,
+    )
+    assertEquals(listOf(105L, 101L, 103L), a2Results.map { it.uid })
+    assertTrue(a2Results.last().isFlagged)
+  }
+
+  @Test
+  fun `CachedDayWindowSummaries and EmailDetail kotlinx serialization round-trip preserves attachments`() {
+    val json = kotlinx.serialization.json.Json {
+      ignoreUnknownKeys = true
+      encodeDefaults = true
+    }
+    val summary = EmailSummary(
+      uid = 42L,
+      accountId = "acc1",
+      accountEmail = "alice@example.com",
+      accountDisplayName = "Alice",
+      subject = "Invoice",
+      fromName = "Billing",
+      fromAddress = "billing@example.com",
+      receivedAtEpochMillis = 1_760_000_000_000L,
+      isUnread = false,
+      hasAttachments = true,
+    )
+    val detail = EmailDetail(
+      summary = summary,
+      toAddresses = listOf("alice@example.com"),
+      ccAddresses = emptyList(),
+      replyToAddress = "billing@example.com",
+      inReplyToHeader = null,
+      referencesHeader = null,
+      plainTextBody = "See attached",
+      htmlBody = null,
+      attachments = listOf(
+        EmailAttachment(
+          partId = "0.1",
+          fileName = "invoice.pdf",
+          mimeType = "application/pdf",
+          sizeBytes = 2048L,
+        ),
+      ),
+    )
+    val cachedWindow = CachedDayWindowSummaries(
+      items = listOf(summary),
+      syncedAtEpochMillis = 1_760_000_123_000L,
+      maxDaysCovered = 2,
+    )
+
+    val encodedWindow = json.encodeToString(CachedDayWindowSummaries.serializer(), cachedWindow)
+    val decodedWindow = json.decodeFromString(CachedDayWindowSummaries.serializer(), encodedWindow)
+    assertEquals(cachedWindow, decodedWindow)
+
+    val encodedDetail = json.encodeToString(EmailDetail.serializer(), detail)
+    val decodedDetail = json.decodeFromString(EmailDetail.serializer(), encodedDetail)
+    assertEquals(detail, decodedDetail)
   }
 }
