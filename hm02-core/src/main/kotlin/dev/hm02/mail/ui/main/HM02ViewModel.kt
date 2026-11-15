@@ -466,6 +466,15 @@ class HM02ViewModel(
     settingsAndContactsStore.updateSettings { it.copy(enablePinToFeed = enabled) }
   }
 
+  fun updateAccentPreset(presetId: String) {
+    val validId = dev.hm02.mail.ui.theme.findFlyAccentPreset(presetId).id
+    settingsAndContactsStore.updateSettings { it.copy(accentPresetId = validId) }
+  }
+
+  fun updateDarkThemeOverride(darkThemeOverride: Boolean?) {
+    settingsAndContactsStore.updateSettings { it.copy(darkThemeOverride = darkThemeOverride) }
+  }
+
   fun toggleFlagged(email: EmailSummary) {
     val nowFlagged = settingsAndContactsStore.toggleFlaggedEmail(email)
     latestSyncedFeedItems = latestSyncedFeedItems.map {
